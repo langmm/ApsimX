@@ -1,0 +1,170 @@
+[bdist_wheel]
+universal = 1
+
+[build-system]
+requires = [
+  "setuptools >= 61.0",
+  "setuptools_scm",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apsimx_gym"
+dynamic = [
+  "version",
+  "readme",
+]
+dependencies = [
+    "gymnasium",
+    "msgpack",
+    "numpy>=1.13.0",
+    "pyzmq",
+]
+
+description = "Gym environment for reinforcement learning using ApsimX"
+license-files = ["LICEN[CS]E*"]
+license = "BSD-3-Clause"
+keywords = [
+  "apsim", "apsimx", "apsimx_gym",
+  "reinforcement leanring", "machine learning",
+]
+authors = [
+  { name="Meagan Lang", email="langmm.astro@gmail.com" },
+]
+maintainers = [
+  { name="Meagan Lang", email="langmm.astro@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+requires-python = ">= 3.10"
+
+# [project.scripts]
+[project.entry-points]
+console_scripts = { apsimx_gym="apsimx_gym.cli:main" }
+
+[project.urls]
+Homepage = "https://github.com/langmm/ApsimX"
+Documentation = "https://github.com/langmm/ApsimX"
+Repository = "https://github.com/langmm/ApsimX"
+Issues = "https://github.com/langmm/ApsimX/issues"
+Changelog = "https://github.com/langmm/ApsimX/blob/main/ApsimXGym/HISTORY.rst"
+
+[project.optional-dependencies]
+dev = [
+  'flake8',
+  'pytest',
+  'pytest-cov',
+  'sphinx',
+  'tox',
+]
+
+[tool.setuptools]
+include-package-data = true
+packages = ["apsimx_gym"]
+
+[tool.setuptools.package-data]
+apsimx_gym = ["data/*.apsimx"]
+
+[tool.setuptools_scm]
+root = ".."
+tag_regex = "^v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+# scm.git.pre_parse = "fail_on_shallow"
+# version_scheme = "only-version"
+fallback_version = "0.0.1"
+scm.git.describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+version_file = "apsimx_gym/_version.py"
+
+[tool.setuptools.dynamic]
+readme = {file = ["README.md", "HISTORY.rst"]}
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+norecursedirs = [
+  ".*", "build", "dist", "CVS", "_darcs", "{arch}", "*.egg",
+]
+testpaths = "tests" 
+filterwarnings = [
+  "error",
+]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+addopts = ["-p", "pytest_cov"]
+
+[tool.coverage.run]
+omit = [
+  "*/lib-python/?.?/*.py",
+  "*/lib_pypy/_*.py",
+  "*/site-packages/ordereddict.py",
+  "*/site-packages/nose/*",
+  "*/unittest2/*",
+]
+
+[tool.coverage.report]
+sort = "Cover"
+ignore_errors = true
+show_missing = true
+exclude_lines = [
+  "pragma: Python 3.8",
+  "pragma: no cover",
+  "pragma: debug",
+  "pragma: in progress",
+  "pragma: config",
+  "pragma: completion",
+  "pragma: testing",
+  "pragma: version",
+  "pragma: intermittent",
+  "pragma: deprecated",
+  "pragma: extern",
+  "def __repr__",
+  "def description_prefix",
+  "if 0:",
+  "if False:",
+  "if __name__ == .__main__.:",
+]
+
+[tool.tox]
+env_list = [
+  "py3{10-14}",
+]
+skip_missing_interpreters = true
+
+[tool.tox.env_run_base]
+dependency_groups = [ "dev" ]
+commands = [[ "pytest" ]]
+
+[tool.cibuildwheel]
+test-requires = ["pytest"]
+test-command = "pytest -m {project}/tests"
+# Based on embreex values
+skip = "*i686 *-win32 *musllinux*"
+manylinux-x86_64-image = "manylinux_2_28"
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312', 'py313', 'py314']
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | _version\.py
+)/
+'''
+
