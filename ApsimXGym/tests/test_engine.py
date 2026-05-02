@@ -58,12 +58,15 @@ class TestApsimXEngine:
                 "[Clock].Start",
                 datetime.datetime(year=1900, month=1, day=1).timestamp()
             )),
+            ("act", RecoverableModelEngineError, (
+                "nitrogen", "hello",
+            )),
         ], ids=[
-            "set", "get", "act", "set_value",
+            "set", "get", "act", "set_value", "act_value",
         ]
     )
-    def test_engine_invalid_irrecoverable(self, instance, new_instance,
-                                          command, error, command_args):
+    def test_engine_invalid(self, instance, new_instance,
+                            command, error, command_args):
         r"""Test error & cleanup on setting a variable that causes
         re-initialization."""
         with new_instance() as instance2:
@@ -131,6 +134,7 @@ class TestApsimXEngine:
             # print("NONE", instance.current_time, value_none)
             # Rewind and run again with full
             instance.rewind()
+            instance.rewind(datetime.timedelta(days=20))
             while instance.is_running and not instance.is_complete:
                 instance.act("nitrogen", 0.001)
                 instance.fast_forward(datetime.timedelta(days=20))
@@ -139,6 +143,7 @@ class TestApsimXEngine:
             # Rewind halfway and run without from there
             instance.rewind(time)
             instance.fast_forward()
+            instance.fast_forward(datetime.timedelta(days=20))
             value_half = instance.get("[Wheat].Grain.Total.Wt")
             # print("HALF", instance.current_time, value_half)
             # Compare
