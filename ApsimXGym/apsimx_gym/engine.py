@@ -1,5 +1,6 @@
 # python RL-Gym/run_interactive.py run Examples/Wheat.apsimx
 import os
+import re
 import json
 import copy
 import zmq
@@ -7,22 +8,183 @@ import msgpack
 import subprocess
 import contextlib
 import datetime
-from typing import Optional, Union
-from functools import cached_property
+import numpy as np
+import pandas as pd
+from typing import Optional, Union, Any, List, Callable
 from . import logger
 from .utils import _gymdir, _apsimxdir, LogPipe
 from .base import (
-    RecoverableError, ModelEngineError,
+    readonly_cached_property,
+    RecoverableError, ModelEngineError, InvalidActionError,
     RecoverableModelEngineError,
-    BaseModelFile, BaseModelEngine, BaseModelEnv,
+)
+from .crop import (
+    CropModelFile, BaseWeatherFile, CropModelEngine,
+    CropModelLLMPromptGenerator, CropModelEnv
 )
 
 
 _datadir = os.path.join(_gymdir, "data")
-_syncfile = os.path.join(_datadir, "Synchroniser.apsimx")
+_syncfile = os.path.join(_datadir, "Synchroniser.json")
 
 
-class ApsimXFile(BaseModelFile):
+def _read_resource(name, apsim_dir: Optional[str] = _apsimxdir):
+    if not (isinstance(apsim_dir, str) and os.path.isdir(apsim_dir)):
+        return {}
+    resource = ApsimXFile(os.path.join(apsim_dir, "Models", "Resources",
+                                       f"{name}.json"))
+    return resource.find(name)
+
+
+class ApsimXWeatherFile(BaseWeatherFile):
+    r"""Container for ApsimX weather data."""
+
+    _power_names = {
+        "year": "TOA_SW_DWN",
+        "day": "TOA_SW_DWN",
+        "radn": "ALLSKY_SFC_SW_DWN",
+        "maxt": "T2M_MAX",
+        "mint": "T2M_MIN",
+        "rain": "PRECTOTCORR",
+        "vp": "T2MDEW",
+    }
+    _conv = {
+        "year": lambda x: pd.to_datetime(x, "%Y%m%d").year,
+        "day": lambda x: pd.to_datetime(x, "%Y%m%d").dayofyear,
+        # From PCSE
+        # Allen, R.G., Pereira, L.S., Raes, D. and Smith, M. (1998) Crop
+        #     evapotranspiration. Guidelines for computing crop water
+        #     requirements, FAO irrigation and drainage paper 56)
+        "vp": lambda x: 6.108 * np.exp((17.27 * x) / (x + 237.3)),  # hPa
+    }
+    _units = {
+        "radn": "MJ/m^2",
+        "maxt": "oC",
+        "mint": "oC",
+        "rain": "mm",
+        "vp": "hPa",
+        "tav": "oC",
+        "amp": "oC",
+        "latitude": "decimal degrees",
+        "longitude": "decimal degrees",
+        "elevation": "m",
+    }
+
+    @classmethod
+    def _read(cls, fname: str):
+        r"""Read a model input file.
+
+        Args:
+            fname: Path to file to read.
+
+        Returns:
+            object: File contents.
+
+        """
+        # return pd.read_csv(fname)
+        out = {
+            "constants": {}
+        }
+        with open(fname, "r") as fd:
+            for line in fd.readline():
+                if not line.startswith("[weather.met.weather]"):
+                    continue
+            for line in fd.readline():
+                if line.startswith("!"):
+                    continue
+                elif line.startswith("year"):
+                    names = line.split()
+                    out["units"] = {
+                        k: x.strip("()")
+                        for k, x in zip(names, fd.readline().split())
+                    }
+                    out["columns"] = pd.read_csv(
+                        fd, sep=r"\s+", names=names,
+                    )
+                else:
+                    pattern = (
+                        r"(?P<name>\w+)\s+\=\s+(?P<value>\d+(\.\d+)?)\s+"
+                        r"\((?P<units>(\w[\w\/\^]*)?)\)"
+                    )
+                    match = re.search(pattern, line)
+                    if not match:
+                        raise ValueError(f"Failed to parse .met line: "
+                                         f"\"{line}\"")
+                    match = match.groupdict()
+                    if match["units"]:
+                        out["units"][match["name"]] = match["units"]
+                    out["constants"][match["name"]] = match["value"]
+        return out
+
+    @classmethod
+    def _write(cls, fname: str, contents):
+        r"""Read a model input file.
+
+        Args:
+            fname: Path to file to read.
+            contents: File contents to write.
+
+        """
+        out = ["[weather.met.weather]"]
+        if "constants" in contents:
+            for k, v in contents["constants"]:
+                out.append(f"{k} = {v} ({contents['units'].get(k, '')})")
+        units = {
+            k: f"({contents['units'].get(k, '')})"
+            for k in contents["columns"].columns
+        }
+        col_space = {k: max(len(k), len(v)) for k, v in units.keys()}
+        for k in list(units.keys()):
+            v = units[k]
+            pad = (col_space[k] - len(v)) * " "
+            units[k] += pad
+        head, body = contents["columns"].to_string(
+            index=False, col_space=col_space,
+        ).split("\n", maxsplit=1)
+        out.append(head)
+        out.append(" " + " ".join(list(units.values())))
+        out.append(body)
+        with open(fname, "w") as fd:
+            fd.write("\n".join(out))
+        # contents.to_csv(fname, index=False)
+
+    @classmethod
+    def _from_power(cls, src: dict):
+        r"""Convert NASA power data into the correct format for this
+        file.
+
+        Args:
+            src: NASA power data.
+
+        Returns:
+            Converted data.
+
+        """
+        fill_value = float(src["header"]["fill_value"])
+        out = {"units": cls._units.copy()}
+        out["constants"] = {
+            "latitude": float(src["geometry"]["coordinates"][0]),
+            "longitude": float(src["geometry"]["coordinates"][1]),
+            "elevation": float(src["geometry"]["coordinates"][2]),
+            "tav": np.mean(
+                pd.Series(src["properties"]["parameter"]["T2M"])),
+        }
+        # description = [src["header"]["title"]]
+        columns = {}
+        for k, v in cls._power_names.items():
+            s = pd.Series(src["properties"]["parameter"][v])
+            s[s == fill_value] = np.nan
+            if k in cls._conv:
+                s = cls._conv[k](s)
+            columns[k] = s
+        columns = pd.DataFrame(columns)
+        ix = columns.isnull().any(axis=1)
+        columns = columns[~ix]
+        out["columns"] = columns
+        return out
+
+
+class ApsimXFile(CropModelFile):
     r"""Container for manipulating .apsimx model files.
 
     Args:
@@ -31,6 +193,348 @@ class ApsimXFile(BaseModelFile):
         contents: Contents to initialize the file with.
 
     """
+
+    ACTION_NODES = dict({
+        "sow": {
+            "conflicts": [
+                {
+                    "contains": {"$type": "Models.Manager, Models"},
+                    "calls": "Sow",
+                },
+            ],
+        },
+        "harvest": {
+            "conflicts": [
+                {
+                    "contains": {"$type": "Models.Manager, Models"},
+                    "calls": "Harvest",
+                },
+            ],
+        },
+        "irrigate": {
+            "parent": {"contains": {"Name": "Field"}},
+            "contains": {"Name": "Irrigation"},
+            "required": True,
+            # "default": os.path.join(_datadir, "Irrigate.json"),
+            "default": {
+                "$type": "Models.Irrigation, Models",
+                "Name": "Irrigation",
+                "ResourceName": "Irrigation",
+                "Children": [],
+                "Enabled": True,
+                "ReadOnly": False,
+            },
+        }
+    }, ** {
+        k: {
+            "parent": {"contains": {"Name": "Field"}},
+            "contains": {"Name": "Fertiliser"},
+            "required": True,
+            # "default": os.path.join(_datadir, "Fertilize.json"),
+            "default": {
+                "$type": "Models.Fertiliser, Models",
+                "Name": "Fertiliser",
+                "ResourceName": "Fertiliser",
+                "Children": [],
+                "Enabled": True,
+                "ReadOnly": False,
+            },
+        }
+        for k in ["fertilize", "nitrogen", "calcium", "phosphorus"]
+    })
+    PARAM_NODES = {
+        "output_vars": {
+            "contains": {
+                "$type": "Models.Report, Models",
+            },
+            # "nested": {
+            #     "EventNames": {"contains": "EndOfDay"},
+            # },
+            "field": "VariableNames",
+            "fget": lambda x: [xx for xx in x if " as " not in xx],
+        },
+        "crop_name": {
+            "anyOf": [
+                {
+                    "contains": {
+                        "$type": "Models.PMF.Plant, Models"
+                    },
+                    "field": "Name",  # "ResourceName"?
+                },
+                {
+                    "contains": {"Name": "SowOrHarvestByDate"},
+                    "parameter": "CropName",
+                },
+            ],
+        },
+        "crop_variety": {
+            "contains": {
+                "$type": "Models.Manager, Models",
+            },
+            "calls": "Sow",
+            "parameter": "CultivarName",
+        },
+        "start_time": {
+            "contains": {"Name": "Clock"},
+            "field": "Start",
+            "fget": datetime.datetime.fromisoformat,
+        },
+        "end_time": {
+            "contains": {"Name": "Clock"},
+            "field": "End",
+            "fget": datetime.datetime.fromisoformat,
+        },
+        "weather_file": {
+            "contains": {
+                "$type": "Models.Climate.Weather, Models",
+            },
+            "field": "FileName",
+            "fset": ApsimXWeatherFile.convert_NASAPower,
+        },
+        # "soil_file": {
+        # }
+        "latitude": {
+            "contains": {
+                "$type": "Models.Soils.Soil, Models",
+            },
+            "field": "Latitude"
+        },
+        "longitude": {
+            "contains": {
+                "$type": "Models.Soils.Soil, Models",
+            },
+            "field": "Longitude",
+        },
+        "field_area": {
+            "contains": {
+                "$type": "Models.Core.Zone, Models",
+            },
+            "field": "Area",
+        },
+        "sow_date": {
+            "parent": {"contains": {"Name": "Field"}},
+            "contains": {"Name": "SowOrHarvestByDate"},
+            "parameter": "SowingDate",
+            "default": os.path.join(_datadir, "SowOrHarvestByDate.json"),
+            "fget": datetime.datetime.fromisoformat,
+            "conflicts": [
+                {
+                    "$type": "Models.Manager, Models",
+                    "calls": "Sow",
+                },
+            ],
+            "parameter_properties": {
+                "CropName": "crop_name",
+                "CultivarName": "crop_variety",
+            },
+        },
+        "harvest_date": {
+            "parent": {"contains": {"Name": "Field"}},
+            "contains": {"Name": "SowOrHarvestByDate"},
+            "parameter": "HarvestDate",
+            "default": os.path.join(_datadir, "SowOrHarvestByDate.json"),
+            "fget": datetime.datetime.fromisoformat,
+            "conflicts": [
+                {
+                    "$type": "Models.Manager, Models",
+                    "calls": "Harvest",
+                },
+            ],
+            "parameter_properties": {
+                "CropName": "crop_name",
+                "CultivarName": "crop_variety",
+            },
+        },
+    }
+
+    @readonly_cached_property
+    def parameter_nodes(self):
+        r"""dict: Previously loaded parameter nodes."""
+        return {}
+
+    def _get_internal_name(self, name: str) -> str:
+        r"""Get the internal variable name from a model parameter name.
+
+        Args:
+            name: Parameter name.
+
+        Returns:
+            str: Internal parameter name.
+
+        """
+        if name not in self.PARAM_NODES:
+            return name
+        info = self.PARAM_NODES[name]
+        node = self.find_parameter(name, required=True)
+        if "parameter" in info:
+            names = [x["Key"] for x in node["Parameters"]]
+            field = info["parameter"]
+            if field not in names:
+                raise KeyError(
+                    f"Parameter \"{field}\" not present in node "
+                    f"\"{node['Name']}\" for parameter \"{name}\" "
+                    f"(Parameters = {names})"
+                )
+            idx = names.index(field)
+            # out = f"[{self.crop_name}].{info['field']}"
+            out = f"[{node['Name']}].Parameters[{idx}].Value"
+        else:
+            out = f"[{node['Name']}].{info['field']}"
+        return out
+
+    @classmethod
+    def _get_node_parameter(cls, node: dict, name: str) -> Any:
+        r"""Extract a node parameter from a parameter list.
+
+        Args:
+            node: Node containing parameters
+            name: Parameter name.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        for x in node["Parameters"]:
+            if isinstance(name, set) and x["Key"] in name:
+                return x["Value"]
+            elif x["Key"] == name:
+                return x["Value"]
+        raise KeyError(f"No parameter named \"{name}\" in {node}")
+
+    @classmethod
+    def _set_node_parameter(cls, node: dict, name: str, value: Any):
+        r"""Set a node parameter.
+
+        Args:
+            node: Node containing parameters
+            name: Parameter name.
+            value: Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        for x in node["Parameters"]:
+            if isinstance(name, set) and x["Key"] in name:
+                x["Value"] = value
+                return
+            elif x["Key"] == name:
+                x["Value"] = value
+                return
+        raise KeyError(f"No parameter named \"{name}\" in {node}")
+
+    @classmethod
+    def _get_parameter(cls, node: dict, info: dict):
+        out = None
+        if "parameter" in info:
+            out = cls._get_node_parameter(node, info["parameter"])
+        elif "field" in info:
+            out = node[info["field"]]
+        elif "anyOf" in info:
+            for x in info["anyOf"]:
+                if cls.node_matches(node, **x):
+                    out = cls._get_parameter(node, x)
+                    break
+            else:
+                errors = []
+                for x in info["anyOf"]:
+                    cls.node_matches(node, errors=errors, **x)
+                raise ValueError(
+                    "Node does not match the requirements:\n  "
+                    + "\n  ".join(errors)
+                )
+        else:
+            raise NotImplementedError(f"Invalid info {info}")
+        if "fget" in info:
+            try:
+                out = info["fget"](out)
+            except ValueError as e:
+                raise KeyError(e)
+        return out
+
+    @classmethod
+    def _set_parameter(cls, node: dict, info: dict, value: Any):
+        if isinstance(value, (datetime.datetime, datetime.date)):
+            value = value.isoformat()
+        if "fset" in info:
+            try:
+                value = info["fset"](value)
+            except ValueError as e:
+                raise KeyError(e)
+        if "parameter" in info:
+            cls._set_node_parameter(node, info["parameter"], value)
+        elif "field" in info:
+            node[info["field"]] = value
+        elif "anyOf" in info:
+            for x in info["anyOf"]:
+                if cls.node_matches(node, **x):
+                    cls._set_parameter(node, x, value)
+                    break
+            else:
+                errors = []
+                for x in info["anyOf"]:
+                    cls.node_matches(node, errors=errors, **x)
+                raise ValueError(
+                    "Node does not match the requirements:\n  "
+                    + "\n  ".join(errors)
+                )
+        else:
+            raise NotImplementedError(f"Invalid info {info}")
+
+    def _get(self, name: str):
+        r"""Get a parameter from the model file.
+
+        Args:
+            name: Parameter name.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        node = self.find_parameter(name, required=True)
+        info = self.PARAM_NODES[name]
+        try:
+            return self._get_parameter(node, info)
+        except KeyError as e:
+            raise KeyError(f"{name}: {e}")
+
+    def _set(self, name: str, value: Any,
+             info: Optional[dict] = None) -> Any:
+        r"""Set a parameter in the model file.
+
+        Args:
+            name: Parameter name.
+            value: Parameter value.
+            info: Information about how to locate the parameter.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        node = self.find_parameter(
+            name, required=True,
+            add_missing=(info is None),
+            info=info,
+        )
+        if info is None:
+            info = self.PARAM_NODES[name]
+        try:
+            self._set_parameter(node, info, value)
+            for xnode in self.findall_parameters(name, info=info):
+                if xnode == node:
+                    continue
+                try:
+                    self._set_parameter(xnode, info, value)
+                except KeyError:
+                    continue
+        except KeyError as e:
+            raise KeyError(f"{name}: {e}")
 
     @classmethod
     def _read(cls, fname: str):
@@ -59,26 +563,406 @@ class ApsimXFile(BaseModelFile):
         with open(fname, "w") as fd:
             json.dump(contents, fd, indent="    ")
 
-    @cached_property
+    @readonly_cached_property
     def is_interactive(self):
         r"""bool: True if the .apsimx model is interactive."""
         return bool(self.find("Synchroniser"))
 
-    def disable(self, name: str):
-        r"""Disable a node in the file if it exists.
+    def disable_parameter_conflicts(self, name: str,
+                                    info: Optional[dict] = None,
+                                    node: Optional[dict] = None):
+        r"""Disable nodes that conflict with a parameter/action.
 
         Args:
-            name: Name of the node to disable.
+            name: Action name.
+            info: Information about the parameter.
+            node: Parameter/action node to avoid disabling.
 
         """
-        node = self.find(name)
+        if info is None:
+            info = (
+                self.ACTION_NODES[name] if name in self.ACTION_NODES
+                else self.PARAM_NODES[name]
+            )
+        if node is None and self.includes_constraints(info):
+            node = self.find_parameter(name, info=info)
+        for vconflict in info.get("conflicts", []):
+            for x in self.findall(requirements=vconflict):
+                if x == node:
+                    continue
+                logger.info(
+                    f"Disabling node \"{x['Name']}\" which "
+                    f"conflicts with parameter/action \"{name}\""
+                )
+                x["Enabled"] = False
+                self.generated = False
+
+    def add_parameter(self, name: str, info: Optional[dict] = None,
+                      parent: Optional[dict] = None) -> dict:
+        r"""Add a node to facilitate use of a parameter/action if it
+        is missing.
+
+        Args:
+            name: Action name.
+            info: Information about how to add the parameter.
+            parent: Parent node that the action node should be added to
+                if it is missing.
+
+        Returns:
+            dict: Action node.
+
+        """
+        if info is None:
+            info = (
+                self.ACTION_NODES[name] if name in self.ACTION_NODES
+                else self.PARAM_NODES[name]
+            )
+        # Do conflicts first before adding the default so that the
+        # default is not disabled by mistake
+        self.disable_parameter_conflicts(name, info=info, node={})
+        default = info.get("default", None)
+        if isinstance(default, str):
+            default = ApsimXFile(default).contents
+        if not default:
+            logger.warning(
+                f"No default node registered for parameter/action "
+                f"\"{name}\""
+            )
+        if parent is None and "parent" in info:
+            parent = self.find(
+                parent=True, requirements=info["parent"]
+            )
+        if not parent:
+            logger.warning(
+                f"No parent node registered for parameter/action "
+                f"\"{name}\""
+            )
+        node = None
+        if parent and default:
+            parent["Children"].append(default.copy())
+            node = parent["Children"][-1]
+            node["Enabled"] = True
+            self.generated = False
+        if node:
+            for k, v in info.get("parameter_properties", {}).items():
+                value = getattr(self, v, None)
+                if value is not None:
+                    self._set_node_parameter(node, k, value)
+                    self.generated = False
+        return node
+
+    def disable_action(self, name: str, **kwargs):
+        r"""Disable any nodes that automatically control an action.
+
+        Args:
+            name: Action name.
+            **kwargs: Additional keyword arguments are passed to
+                find_parameter.
+
+        """
+        node = self.find_parameter(name, **kwargs)
         if node is not None:
             node["Enabled"] = False
             self.generated = False
 
-    def find(self, name: str, current: Optional[dict] = None,
+    def enable_action(self, name: str, parent: Optional[dict] = None,
+                      **kwargs):
+        r"""Enable any nodes that automatically control an action.
+
+        Args:
+            name: Action name.
+            parent: Parent node that the action node should be added to
+                if it is missing.
+            **kwargs: Additional keyword arguments are passed to
+                find_parameter.
+
+        Returns:
+            dict: Action node.
+
+        """
+        info = self.ACTION_NODES[name]
+        if not self.includes_constraints(info):
+            self.disable_parameter_conflicts(name, info=info, node={})
+            return
+        return self.find_parameter(
+            name, info=info,
+            add_missing=(parent if parent else True),
+            current=parent, **kwargs
+        )
+
+    def disable(self, name: str, **kwargs):
+        r"""Disable a node in the file if it exists.
+
+        Args:
+            name: Name of the node to disable.
+            **kwargs: Additional keyword arguments are passed to find.
+
+        """
+        node = self.find(name, **kwargs)
+        if node is not None:
+            node["Enabled"] = False
+            self.generated = False
+
+    @classmethod
+    def includes_constraints(cls, info: dict):
+        return any(k in info for k in [
+            "name", "field", "parameter", "contains",
+            "equals", "fvalid", "calls", "anyOf", "nested"])
+
+    @classmethod
+    def node_matches(cls, node: Any,
+                     errors: Optional[list] = None,
+                     name: Optional[str] = None,
+                     field: Optional[str] = None,
+                     parameter: Optional[str] = None,
+                     contains: Optional[Union[list, set, dict]] = None,
+                     equals: Optional[Any] = None,
+                     fvalid: Optional[Callable] = None,
+                     calls: Optional[str] = None,
+                     anyOf: Optional[list] = None,
+                     nested: Optional[dict] = None,
+                     **kwargs) -> bool:
+        r"""Check if a node matches the specified requirements.
+
+        Args:
+            node: Node to check.
+            errors: If a list is provided, errors will be added to this
+                list.
+            name: Name that the node must have.
+            field: Name of a field that must be present.
+            parameter: Name of a parameter that must be present.
+            contains: Fields/elements that the node must contain. If a
+                set is provided, only one of the elements must be
+                present. If a dict is provided, the values in the node
+                must match the values in the provided dict.
+            equals: Value that the node must be equivalent to.
+            fvalid: Function that returns True if the node is valid, and
+                False otherwise.
+            calls: Name of a function called in the node code block.
+            anyOf: List of kwargs for node_matches that should be
+                checked. If the node satisfies any of these requirements,
+                True will be returned.
+            nested: Set of requirements for individual fields.
+            **kwargs: Additional keyword arguments are ignored.
+
+        Returns:
+            bool: True if the node matches, False otherwise.
+
+        """
+
+        def add_error(msg):
+            if not isinstance(errors, list):
+                return False
+            errors.append(msg)
+            return True
+
+        if anyOf:
+            if isinstance(errors, list):
+                xerrors = []
+                if not any(cls.node_matches(node, errors=xerrors, **x)
+                           for x in anyOf):
+                    errors += xerrors
+            else:
+                if not any(cls.node_matches(node, **x) for x in anyOf):
+                    return False
+        if name is not None and node.get("Name", None) != name:
+            if not add_error(f"{node} name is not {name}"):
+                return False
+        if field is not None and field not in node:
+            if not add_error(f"{node} is missing field \"{field}\""):
+                return False
+        if ((parameter is not None
+             and not any(x["Key"] == parameter
+                         for x in node.get("Parameters", [])))):
+            if not add_error(f"{node} is missing parameter \"{parameter}\""):
+                return False
+        if contains:
+            if isinstance(contains, str):
+                contains = [contains]
+            if isinstance(contains, set):
+                missing = (
+                    list(contains)
+                    if not any(k in node for k in contains)
+                    else []
+                )
+            elif isinstance(contains, dict):
+                missing = [k for k in contains.keys() if k not in node]
+            else:
+                assert isinstance(contains, list)
+                missing = [k for k in contains if k not in node]
+            if missing and not add_error(f"Missing {missing}"):
+                return False
+            if isinstance(contains, dict):
+                for k, v in contains.items():
+                    if k not in node:
+                        continue
+                    if node[k] != v and not add_error(
+                            f"{k}: {node[k]} != {v}"):
+                        return False
+        if equals and node != equals:
+            if not add_error(f"{node} != {equals}"):
+                return False
+        if fvalid and not fvalid(node):
+            if not add_error(f"{node} fails function {fvalid}"):
+                return False
+        if ((calls and not (
+                isinstance(node, dict)
+                and any(f"{calls}(" in x
+                        for x in node.get("CodeArray", []))))):
+            if not add_error(f"{node} does not call \"{calls}\""):
+                return False
+        if nested:
+            missing = [k for k in nested.keys() if k not in node]
+            if missing and not add_error(f"Missing {missing}"):
+                return False
+            for k, v in nested.items():
+                if k not in node:
+                    continue
+                if isinstance(errors, list):
+                    verrors = []
+                    cls.node_matches(node[k], errors=verrors, **v)
+                    errors += [f"{k}: {x}" for x in verrors]
+                elif not cls.node_matches(node[k], **v):
+                    return False
+        # if kwargs:
+        #     missing = [k for k in kwargs.keys() if k not in node]
+        #     if missing and not add_error(f"Missing {missing}"):
+        #         return False
+        #     for k, v in kwargs.items():
+        #         if k not in node:
+        #             continue
+        #         if node[k] != v and not add_error(f"{k}: {node[k]} != {v}"):
+        #             return False
+        if errors:
+            return False
+        return True
+
+    def findall_parameters(self, name: str, info: Optional[dict] = None,
+                           **kwargs):
+        r"""Find all parameters nodes in this file matching the
+        parameter info.
+
+        Args:
+            name: Parameter name.
+            info: Information about how to locate the parameter.
+            **kwargs: Additional keyword arguments are passed to findall.
+
+        Yields:
+            dict: The nodes matching the parameter info.
+
+        Raises:
+            KeyError: If info not provided and name is not a valid
+                parameter/action.
+
+        """
+        if info is None:
+            if ((name not in self.PARAM_NODES
+                 and name not in self.ACTION_NODES)):
+                raise KeyError(f"No node registered for parameter "
+                               f"\"{name}\"")
+            info = (
+                self.PARAM_NODES[name] if name in self.PARAM_NODES
+                else self.ACTION_NODES[name]
+            )
+        for node in self.findall(requirements=info, **kwargs):
+            yield node
+
+    def find_parameter(self, name: str,
+                       add_missing: Optional[Union[bool, dict]] = False,
+                       info: Optional[dict] = None,
+                       **kwargs) -> dict:
+        r"""Find a parameter node in the file.
+
+        Args:
+            name: Parameter name.
+            add_missing: If True or dict, the default for the parameter
+                will be added if it cannot be located. If a dict is
+                provided, the parameter default will be added to this if
+                the parameter cannot be located.
+            info: Information about how to locate the parameter.
+            **kwargs: Additional keyword arguments are passed to find.
+
+        Returns:
+            dict: The node matching the specified name. Empty if no
+                node can be found.
+
+        Raises:
+            KeyError: If required is True and the node cannot be located.
+
+        """
+        if info is None:
+            if ((name not in self.PARAM_NODES
+                 and name not in self.ACTION_NODES)):
+                if not kwargs.get("required", False):
+                    return {}
+                raise KeyError(f"No node registered for parameter "
+                               f"\"{name}\"")
+            info = (
+                self.PARAM_NODES[name] if name in self.PARAM_NODES
+                else self.ACTION_NODES[name]
+            )
+        if ((name in self.parameter_nodes
+             and not kwargs.get("parent", False))):
+            return self.parameter_nodes[name]
+        try:
+            node = self.find(requirements=info, **kwargs)
+            if add_missing and not node:
+                assert not kwargs.get("parent", False)  # corner case
+                node = self.add_parameter(
+                    name, info=info, parent=(
+                        add_missing if isinstance(add_missing, dict)
+                        else None
+                    ),
+                )
+            if node and not kwargs.get("parent", False):
+                self.parameter_nodes[name] = node
+            return node
+        except KeyError as e:
+            if add_missing and not node:
+                assert not kwargs.get("parent", False)  # corner case
+                node = self.add_parameter(name)
+                if node:
+                    return node
+            raise KeyError(f"{name}: {e}")
+
+    def findall(self, name: Optional[str] = None,
+                current: Optional[dict] = None,
+                parent: Optional[Union[bool, dict]] = False,
+                requirements: Optional[dict] = None) -> list:
+        r"""Find a node in the file.
+
+        Args:
+            name: Name of the node to find.
+            current: The current node being searched.
+            parent: The parent node. If True, the parent node will be
+                returned.
+            requirements: Set of requirements that the node must
+                satisfy (see node_matches for a description of the
+                available options).
+
+        Yields:
+            dict: All nodes matching the specified name.
+
+        """
+        requirements = requirements or {}
+        assert name is not None or requirements
+        if current is None:
+            current = self.contents
+        if self.node_matches(current, name=name, **requirements):
+            yield parent if parent else current
+        for x in current.get("Children", []):
+            for out in self.findall(
+                    name=name, current=x,
+                    parent=(current if parent else False),
+                    requirements=requirements
+            ):
+                yield out
+
+    def find(self, name: Optional[str] = None,
+             current: Optional[dict] = None,
              parent: Optional[Union[bool, dict]] = False,
-             required: Optional[bool] = False) -> dict:
+             required: Optional[bool] = False,
+             requirements: Optional[dict] = None) -> dict:
         r"""Find a node in the file.
 
         Args:
@@ -88,75 +972,124 @@ class ApsimXFile(BaseModelFile):
                 returned.
             required: If True, an error will be raised if the node
                 cannot be located.
+            requirements: Set of requirements that the node must
+                satisfy (see node_matches for a description of the
+                available options).
 
         Returns:
             dict: The node matching the specified name. Empty if no
                 node can be found.
 
         Raises:
-            ValueError: If required is True and the node cannot be located.
+            KeyError: If required is True and the node cannot be located.
 
         """
+        requirements = requirements or {}
+        assert name is not None or requirements
         if current is None:
             current = self.contents
-        if current["Name"] == name:
-            if parent:
-                return parent
-            return current
+        if self.node_matches(current, name=name, **requirements):
+            out = parent if parent else current
+            return out
         for x in current.get("Children", []):
-            out = self.find(name, current=x,
-                            parent=(current if parent else False))
+            out = self.find(name=name, current=x,
+                            parent=(current if parent else False),
+                            requirements=requirements)
             if out:
                 return out
         if required:
-            raise ValueError(f"Could not locate a node with the name "
-                             f"\"{name}\"")
+            msg = ""
+            if name is not None:
+                msg += f" with \"Name\" {name}"
+            if requirements:
+                msg += f" matching requirements {requirements}"
+            raise KeyError(f"Could not locate a node{msg}")
         return {}
 
-    def _set_simulation_times(
-            self,
-            start_time: Optional[datetime.datetime] = None,
-            end_time: Optional[datetime.datetime] = None,
-            sow_date: Optional[datetime.datetime] = None,
-            harvest_date: Optional[datetime.datetime] = None,
-    ):
-        r"""Set the simulation start/end time in the file contents.
+    def _make_interactive(self, actions: list):
+        r"""Modify this file to make it interactive.
 
         Args:
-            start_time: Simulation start time.
-            end_time: Simulation end time.
-            sow_date: Date that the crop should be sown.
-            harvest_date: Date that the crop should be harvested.
+            actions: List of actions that should be enabled.
 
         """
-        clock = self.find("Clock", required=True)
-        if start_time is not None:
-            clock["Start"] = start_time.isoformat()
-        if end_time is not None:
-            clock["End"] = end_time.isoformat()
-
-    def _make_interactive(self):
-        r"""Modify this file to make it interactive."""
         sync = ApsimXFile(_syncfile)
         field = self.find("Field", required=True)
+        for k, v in self.ACTION_NODES.items():
+            parent = None
+            if "parent" in v and self.node_matches(field, **v["parent"]):
+                parent = field
+            if k not in actions:
+                if v.get("required", False):
+                    self.find_parameter(
+                        k, current=parent, required=True,
+                        add_missing=(parent if parent else True),
+                    )
+                else:
+                    self.disable_action(k)
+                continue
+            self.enable_action(k, parent=parent)
+        # Do sync last to avoid it being disabled
         field["Children"].append(copy.deepcopy(sync.contents))
-        for k in ["Fertiliser", "Irrigation"]:
-            if not self.find(k):
-                v = {
-                    "$type": f"Models.{k}, Models",
-                    "Name": k,
-                    "ResourceName": k,
-                    "Children": [],
-                    "Enabled": True,
-                    "ReadOnly": False,
-                }
-                field["Children"].append(v)
+
+
+_fertilizer_node = _read_resource("Fertiliser")
+
+
+def _fertilizer_action(name: Optional[str] = None,
+                       solutes: Optional[List[str]] = None,
+                       **kwargs):
+    if name is None:
+        fullname = "fertilizer"
+    else:
+        fullname = f"{name} fertilizer"
+    if solutes:
+        types = []
+        for x in _fertilizer_node.get("Children", []):
+            for i in range(1, 10):
+                field = f"Solute{i}Name"
+                if field not in x:
+                    break
+                if x[field] in solutes:
+                    types.append(x["Name"])
+    else:
+        types = [x["Name"] for x in _fertilizer_node.get("Children", [])]
+    out = {
+        "description": (
+            "Apply {amount} {amount_units} "
+            + fullname + " in the form of {type}"
+        ),
+        "action_param": "amount",
+        "param_desc": {
+            "amount": {
+                "type": "number",
+                "units": "kg/ha",
+                "min": 0.0,
+                "max": 8.0,
+            },
+            "type": {
+                "type": "string",
+                "default": types[0] if types else name,
+                "enum": types,
+            },
+            # "depth": {
+            #     "type": "number",
+            #     "units": "mm",
+            # },
+            # "depthBottom": {
+            #     "type": "number",
+            #     "units": "mm",
+            # },
+        },
+    }
+    out.update(**kwargs)
+    return out
 
 
 # connect -> ok
 # paused -> resume/get/set
 # finished -> ok
-class ApsimXEngine(BaseModelEngine):
+class ApsimXEngine(CropModelEngine):
     r"""Class for managing communication with an APSIMX server running
     in another process.
 
@@ -164,7 +1097,7 @@ class ApsimXEngine(BaseModelEngine):
         model_file: Path to a .apsimx model input file.
         apsimx_dir: Path to the directory containing APSIMX installation.
         **kwargs: Additional keyword arguments are passed to the
-            BaseModelEngine constructor.
+            CropModelEngine constructor.
 
     """
 
@@ -175,43 +1108,92 @@ class ApsimXEngine(BaseModelEngine):
         "error", "recoverable_error",
     ]
     INPUT_FILE_TYPE = ApsimXFile
+    WEATHER_FILE_TYPE = ApsimXWeatherFile
     AVAILABLE_ACTION_MAP = {
         "sow": {
-            "description": "Sow a crop",
-            "param": [
-                "cropName", "cultivarName", "population",
-                "sowingDepth", "rowSpacing",
-            ],
-            "num_levels": 1,  # Boolean
+            "description": (
+                "Sow a {crop_variety} {crop_name} crop at a density "
+                "of {population} {population_units} with a sowing "
+                "depth of {sowingDepth} {sowingDepth_units} and a row "
+                "spacing of {rowSpacing} {rowSpacing_units}"
+            ),
+            "action_param": None,  # Boolean
+            "param_desc": {
+                "crop_name": {
+                    "type": "string",
+                },
+                "crop_variety": {
+                    "type": "string",
+                    "default": "Hartog",
+                },
+                "population": {
+                    "type": "number",
+                    "units": "seeds per square meter",  # seeds/m²
+                    "default": 5.0,
+                },
+                "sowingDepth": {
+                    "type": "number",
+                    "units": "mm",
+                    "default": 50.0,
+                },
+                "rowSpacing": {
+                    "type": "number",
+                    "units": "mm",
+                    "default": 1000.0,
+                },
+            },
+            "num_levels": -1,  # Boolean
         },
         "harvest": {
-            "description": "Harvest a crop",
-            "param": [
-                "cropName",
-            ],
-            "num_levels": 1,  # Boolean
+            "description": "Harvest the {crop_name} crop",
+            "action_param": None,  # Boolean
+            "param_desc": {
+                "crop_name": {
+                    "type": "string",
+                    "default": "",
+                },
+            },
+            "num_levels": -1,  # Boolean
         },
         "tillage": {
-            "description": "Till the field",
-            "param": ["type"],
-            "num_levels": 1,  # Boolean
+            "description": "Till the field using {type} tillage",
+            "action_param": "type",
+            "param_desc": {
+                "type": {
+                    "type": "string",
+                    "enum": ["chisel", "disc", "planter", "burn"],
+                },
+            },
         },
-        "nitrogen": {
-            "alias": "N",
-            "max": 8.0,
-            "units": "kg/ha",
-            "description": "Apply {amount} {units} nitrogen fertilizer.",
-            # "cost": 0.46,  # $/kg
-            "param": ["amount", "type", "depth", "depthBottom"],
-        },
+        "fertilize": _fertilizer_action(),
+        "nitrogen": _fertilizer_action(
+            "nitrogen", ["NO3", "NH4", "Urea"],
+            alias="N",  # cost=0.46,  # $/kg
+        ),
+        "calcium": _fertilizer_action(
+            "calcium", ["Ca"],
+            alias="Ca",
+        ),
+        "phosphorus": _fertilizer_action(
+            "phosphorus", ["RockP", "LabileP", "BandedP"],
+            alias="P",
+        ),
         "irrigate": {
             "alias": "water",
-            "max": 20.0,
-            "units": "mm",
-            "description": "Irrigate with {amount} {units} of water.",
+            "description": (
+                "Irrigate with {amount} {amount_units} of water."
+            ),
+            "action_param": "amount",
             # 1 mm over 1 ha == 10000 L, $20 per 10000 L
             # "cost": 20.0,  # $/mm/ha
-            "param": ["amount"],
+            "param_desc": {
+                "amount": {
+                    "type": "number",
+                    "units": "mm",
+                    "min": 0.0,
+                    "max": 20.0,
+                },
+            },
         },
     }
 
@@ -246,20 +1228,6 @@ class ApsimXEngine(BaseModelEngine):
             # ApsimX saves output to the directory containing the
             # model input file
             self.output_dir = os.path.dirname(self.model.fname)
-
-    def update_model_file(self):
-        r"""Update the model file to make it interactive and set the
-        start/end times."""
-        if self.sow_date is not None:
-            self.action_map.pop("sow", None)
-        if self.harvest_date is not None:
-            self.action_map.pop("harvest", None)
-        if self.harvest_date or "harvest" in self.action_map:
-            self.model.disable("Harvest")
-        if self.sow_date or "sow" in self.action_map:
-            self.model.disable("Sow using a variable rule")
-        # TODO: Add other actions?
-        super().update_model_file()
 
     @property
     def is_running(self):
@@ -307,7 +1275,7 @@ class ApsimXEngine(BaseModelEngine):
         return os.path.join(
             os.path.splitext(self.model.fname)[0] + ".db")
 
-    def start(self):
+    def _start(self):
         r"""Start a listening server on a random port."""
         self._current_time = None
         self._status = None
@@ -341,9 +1309,8 @@ class ApsimXEngine(BaseModelEngine):
             self.end_time = self.get("[Clock].End")
         else:
             assert self.get("[Clock].End") == self.end_time
-        logger.info(f"Simulating from {self.start_time} to {self.end_time}")
 
-    def stop(self):
+    def _stop(self):
         r"""Stop the listening server and close the communication port."""
         if self.is_operable:
             self.act("terminate")
@@ -470,6 +1437,10 @@ class ApsimXEngine(BaseModelEngine):
 
         """
         reply = None
+        try:
+            name = self.model._get_internal_name(name)
+        except KeyError as e:
+            raise InvalidActionError(e)
         self.send_command("get", [name])
         reply = self.recv_reply(unpack=True)
         if reply in self.ERROR_MESSAGES:
@@ -489,7 +1460,11 @@ class ApsimXEngine(BaseModelEngine):
             value: New value for the named variable.
 
         """
-        if isinstance(value, datetime.datetime):
+        try:
+            name = self.model._get_internal_name(name)
+        except KeyError as e:
+            raise InvalidActionError(e)
+        if isinstance(value, (datetime.datetime, datetime.date)):
             value = value.isoformat()
         self.send_command("set", [name, value])
         reply = self.recv_reply()
@@ -531,10 +1506,43 @@ class ApsimXEngine(BaseModelEngine):
             self.status
 
 
-class ApsimXEnv(BaseModelEnv):
+class ApsimXLLMPromptGenerator(CropModelLLMPromptGenerator):
+    r"""ApsimX LLM prompt generator."""
+
+    DEFAULT_DESC_MAP = {
+        # TODO: Handle case of different crop/non-PMF model
+        "[Wheat].Phenology.Zadok.Stage": (
+            "Crop status", "Zadok developmental tage"),
+        "[Wheat].Grain.Total.Wt": (
+            "Crop status", "Crop yield (g/m²)"),
+        # "[Wheat].Biomass.StorageWt": (
+        #     "Crop status", "Storage organ dry matter (g/m²)"),
+        "[Nutrient].TotalN.kgha": (
+            "Soil nutrients", "Available soil nitrogen (kg/ha)"),
+        "[Soil].Water.PAW": (
+            "Soil & water",
+            "Plant-available root-zone soil moisture (fraction)"),
+        "[Fertiliser].NitrogenApplied": (
+            "Cumulative actions",
+            "Cumulative nitrogen applied so far (kg/ha)"),
+        "[Irrigation].IrrigationApplied": (
+            "Cumulative actions",
+            "Cumulative irrigation depth applied so far (mm)"),
+        "[Weather].Radn": (
+            "Weather", "Daily solar radiation (MJ/m²/day)"),
+        "[Weather].Tav": (
+            "Weather", "Mean air temperature (°C)"),
+        "[Weather].Rain": (
+            "Weather", "Daily rainfall (mm)"),
+        "[Wheat].DaysAfterSowing": ("Timeline", "Days since sowing"),
+    }
+
+
+class ApsimXEnv(CropModelEnv):
     r"""ApsimX environment."""
 
     MODEL_ENGINE_CLASS = ApsimXEngine
+    LLM_PROMPT_GENERATOR_CLASS = ApsimXLLMPromptGenerator
     DEFAULT_ACTIONS = ["nitrogen", "irrigate"]
     DEFAULT_REVENUE_VAR = {
         "name": "[Wheat].Grain.Total.Wt",

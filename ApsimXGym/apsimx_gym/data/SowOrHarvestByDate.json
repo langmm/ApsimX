@@ -1,0 +1,100 @@
+{
+    "$type": "Models.Manager, Models",
+    "CodeArray": [
+        "",
+        "using Models.Soils;",
+        "using System.Linq;",
+        "using System;",
+        "using Models.Core;",
+        "using Models.PMF;",
+        "using Models.Utilities;",
+        "",
+        "namespace Models",
+        "{",
+        "    [Serializable] ",
+        "    public class Script : Model",
+        "    {",
+        "        [Link] Clock Clock;",
+        "",
+        "        [Description(\"Crop Name\")]",
+        "        public string CropName { get; set; }",
+        "",
+        "        [Description(\"Cultivar Name\")]",
+        "        public string CultivarName { get; set; }",
+        "",
+        "        [Description(\"Sowing Date\")]",
+        "        public DateTime SowingDate { get; set; }",
+        "",
+        "        [Description(\"Spacing (m) between rows\")]",
+        "        public double RowSpacing { get; set; }",
+        "",
+        "        [Description(\"Population density (/m2)\")]",
+        "        public double Population { get; set; }",
+        "",
+        "        [Description(\"Sowing depth (mm)\")]",
+        "        public double SowingDepth { get; set; }",
+        "",
+        "        [Description(\"Harvest Date\")]",
+        "        public DateTime HarvestDate { get; set; }",
+        "",
+        "        [EventSubscribe(\"DoManagement\")]",
+        "        private void OnDoManagement(object sender, EventArgs e)",
+        "        {",
+        "",
+        "            if ((CropName != \"<undefined>\") &&",
+        "                (Clock.Today.Date == SowingDate ||",
+        "                 Clock.Today.Date == HarvestDate)) {",
+        "                Plant crop = FindByPath(\"[\" + CropName + \"]\")?.Value as Plant;",
+        "                if (crop == null) { throw new Exception(\"Cant find a component called '\" + CropName + \"' to sow/harvest\"); }",
+        "                if (CultivarName == \"<undefined>\") {",
+        "                    CultivarName = crop.CultivarNames[0];",
+        "                }",
+        "                if (Clock.Today.Date == SowingDate) {",
+        "                    crop.Sow(population: Population, ",
+        "                        cultivar: CultivarName, ",
+        "                        depth: SowingDepth, ",
+        "                        rowSpacing: RowSpacing);",
+        "                } else {",
+        "                    crop.Harvest();",
+        "                }",
+        "            }",
+        "        }",
+        "    }",
+        "}"
+    ],
+    "Parameters": [
+        {
+            "Key": "CropName",
+            "Value": "<undefined>"
+        },
+        {
+            "Key": "CultivarNmae",
+            "Value": "<undefined>"
+        },
+        {
+            "Key": "SowingDate",
+            "Value": "01/01/1000"
+        },
+        {
+            "Key": "RowSpacing",
+            "Value": "1000"
+        },
+        {
+            "Key": "Population",
+            "Value": "5"
+        },
+        {
+            "Key": "SowingDepth",
+            "Value": "50"
+        },
+        {
+            "Key": "HarvestDate",
+            "Value": "01/01/1000"
+        }
+    ],
+    "Name": "SowOrHarvestByDate",
+    "ResourceName": null,
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false
+}

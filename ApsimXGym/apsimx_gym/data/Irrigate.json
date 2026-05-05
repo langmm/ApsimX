@@ -1,0 +1,8 @@
+{
+    "$type": "Models.Irrigation, Models",
+    "Name": "Irrigation",
+    "ResourceName": "Irrigation",
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false,
+}

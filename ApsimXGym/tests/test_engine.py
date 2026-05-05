@@ -1,3 +1,4 @@
+import numpy as np
 import datetime
 import logging
 import contextlib
@@ -14,20 +15,23 @@ logger.setLevel(logging.INFO)
 class TestApsimXEngine:
 
     @pytest.fixture(scope="class")
-    def new_instance(self, example_model, apsimx_dir):
+    def default_instance_kwargs(self, apsimx_dir):
+        return {
+            "actions": ["nitrogen", "irrigate"],
+            "apsimx_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1900, month=1, day=1),
+            "end_time": datetime.datetime(year=1900, month=12, day=31),
+        }
+
+    @pytest.fixture(scope="class")
+    def new_instance(self, example_model, default_instance_kwargs):
 
         @contextlib.contextmanager
         def _new_instance(model_file=None, **kwargs):
             if model_file is None:
                 model_file = example_model
-            kwargs.setdefault("apsimx_dir", apsimx_dir)
-            kwargs.setdefault("actions", ["nitrogen", "irrigate"])
-            kwargs.setdefault(
-                "start_time",
-                datetime.datetime(year=1900, month=1, day=1))
-            kwargs.setdefault(
-                "end_time",
-                datetime.datetime(year=1900, month=12, day=31))
+            for k, v in default_instance_kwargs.items():
+                kwargs.setdefault(k, v)
             instance = ApsimXEngine(model_file, **kwargs)
             instance.start()
             try:
@@ -42,6 +46,14 @@ class TestApsimXEngine:
     def instance(self, new_instance):
         with new_instance(model_suffix="-Prime") as instance:
             yield instance
+
+    def test_attributes(self, instance):
+        r"""Test instance attributes."""
+        assert instance.crop_name == "Wheat"
+        assert instance.crop_variety == "Hartog"
+        assert instance.location != "the field"
+        assert instance.field_area == 1.0
+        print(instance.get_output_vars())
 
     @pytest.mark.parametrize(
         "command,error,command_args", [
@@ -121,41 +133,216 @@ class TestApsimXEngine:
     def test_scrub(self, new_instance):
         r"""Test rewind/fast-forward."""
         # TODO: Use existing instance
+        start_time = datetime.datetime(year=1900, month=1, day=1)
+        end_time = datetime.datetime(year=1900, month=11, day=5)
         with new_instance(
-            start_time=datetime.datetime(year=1900, month=1, day=1),
-            end_time=datetime.datetime(year=1900, month=11, day=5),
+                start_time=start_time, end_time=end_time
         ) as instance:
-            # time = datetime.datetime(year=1900, month=9, day=22)
-            time = datetime.datetime(year=1900, month=5, day=22)
+            time = datetime.datetime(year=1900, month=5, day=23)
             # Run complete simulation without fertilizing
+            assert instance.current_time == start_time
             instance.fast_forward()
+            assert instance.current_time == end_time
             assert instance.is_running
             value_none = instance.get("[Wheat].Grain.Total.Wt")
             # print("NONE", instance.current_time, value_none)
             # Rewind and run again with full
             instance.rewind()
             instance.rewind(datetime.timedelta(days=20))
+            assert instance.current_time == start_time
             while instance.is_running and not instance.is_complete:
                 instance.act("nitrogen", 0.001)
                 instance.fast_forward(datetime.timedelta(days=20))
+            assert instance.current_time == end_time
             value_full = instance.get("[Wheat].Grain.Total.Wt")
             # print("FULL", instance.current_time, value_full)
             # Rewind halfway and run without from there
             instance.rewind(time)
+            assert instance.current_time == time
             instance.fast_forward()
+            assert instance.current_time == end_time
             instance.fast_forward(datetime.timedelta(days=20))
             value_half = instance.get("[Wheat].Grain.Total.Wt")
             # print("HALF", instance.current_time, value_half)
             # Compare
             assert value_half > value_none
             assert value_full > value_half
+            instance.rewind()
+            assert instance.current_time == start_time
+
+    def test_action_param(self, new_instance):
+        r"""Test actions with parameters."""
+        with new_instance(
+                actions=[
+                    "nitrogen", "irrigate", "tillage", "sow", "harvest"
+                ],
+                action_param={
+                    "sow": {"population": 10.0, "cropName": "Wheat"},
+                },
+        ) as instance:
+            instance.act("tillage", "disc")
+            instance.act("nitrogen", 160.0, type="UreaN")
+            instance.act("sow", sowingDepth=10.0)
+            instance.fast_forward(
+                datetime.datetime(year=1900, month=5, day=23))
+            instance.act("harvest")
 
 
-def test_env(example_model, apsimx_dir):
-    r"""Test of environment creation."""
-    logger.setLevel(logging.INFO)
-    try:
-        env = ApsimXEnv(example_model, apsimx_dir=apsimx_dir)
-    finally:
-        env.model.stop()
-        env.model.model.cleanup()
+class TestApsimXEnv:
+    r"""Test use of ApsimXEnv for exclusive, discrete actions."""
+
+    @pytest.fixture(scope="class")
+    def default_instance_kwargs(self, apsimx_dir):
+        return {
+            "apsimx_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1900, month=1, day=1),
+            "end_time": datetime.datetime(year=1900, month=12, day=31),
+        }
+
+    @pytest.fixture(scope="class")
+    def new_instance(self, example_model, default_instance_kwargs):
+
+        @contextlib.contextmanager
+        def _new_instance(model_file=None, **kwargs):
+            if model_file is None:
+                model_file = example_model
+            for k, v in default_instance_kwargs.items():
+                kwargs.setdefault(k, v)
+            env = ApsimXEnv(model_file, **kwargs)
+            try:
+                yield env
+            finally:
+                env.close()
+                env.model.model.cleanup()
+
+        return _new_instance
+
+    @pytest.fixture(scope="class")
+    def instance(self, new_instance):
+        with new_instance(model_suffix="-Prime") as instance:
+            yield instance
+
+    @pytest.fixture(scope="class")
+    def sampled_action_id(self, instance):
+        return instance.action_map.space.sample()
+
+    @pytest.fixture(params=[0, 1])
+    def action_id(self, request):
+        r"""int: Action ID."""
+        return request.param
+
+    @pytest.fixture(params=[
+        {
+            "nitrogen": np.array([0.5]),
+            "irrigate": np.array([0.5]),
+        },
+        (1, np.array([0.5])),
+    ])
+    def invalid_action_id(self, request):
+        r"""int: Action ID."""
+        return request.param
+
+    def test_description(self, instance):
+        r"""Test description generation."""
+        instance.action_map.description
+
+    def test_action_description(self, instance, action_id,
+                                sampled_action_id,
+                                assert_nested_allclose):
+        r"""Test description generation."""
+        desc = instance.action_map.action2description(action_id)
+        assert instance.action_map.description2action(desc) == action_id
+        desc = instance.action_map.action2description(sampled_action_id)
+        assert_nested_allclose(
+            instance.action_map.description2action(desc),
+            sampled_action_id,
+            atol=0.1
+        )
+
+    def test_invalid_action(self, instance, invalid_action_id):
+        with pytest.raises(InvalidActionError):
+            instance.action_map.action2description(invalid_action_id)
+
+    def test_step(self, instance, sampled_action_id):
+        r"""Test environment step."""
+        instance.step(sampled_action_id)
+        instance.reset()
+
+    def test_prompt_generator(self, instance, action_id,
+                              sampled_action_id, assert_nested_allclose):
+        r"""Test creation of prompt generator."""
+        prompt = instance.get_llm_prompt_generator()
+        prompt.get_system_prompt()
+        desc = prompt.describe_action(action_id)
+        assert prompt.parse_action_response(desc) == action_id
+        desc = prompt.describe_action(sampled_action_id)
+        assert_nested_allclose(
+            prompt.parse_action_response(desc), sampled_action_id,
+            atol=0.1
+        )
+        assert prompt.parse_action_response("Invalid response") is None
+
+
+class TestApsimXEnvContinuous(TestApsimXEnv):
+    r"""Test use of ApsimXEnv with exclusive, continuous actions."""
+
+    @pytest.fixture(scope="class")
+    def default_instance_kwargs(self, apsimx_dir):
+        return {
+            "apsimx_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1900, month=1, day=1),
+            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "num_levels": 0,
+        }
+
+    @pytest.fixture(params=[
+        (0, 0),
+        (1, np.array([0.5])),
+    ])
+    def action_id(self, request):
+        r"""int: Action ID."""
+        return request.param
+
+    @pytest.fixture(params=[
+        0,
+        {
+            "nitrogen": np.array([0.5]),
+            "irrigate": np.array([0.5]),
+        },
+    ])
+    def invalid_action_id(self, request):
+        r"""int: Action ID."""
+        return request.param
+
+
+class TestApsimXEnvSimultaneous(TestApsimXEnv):
+    r"""Test use of ApsimXEnv with non-exclusive, continuous actions."""
+
+    @pytest.fixture(scope="class")
+    def default_instance_kwargs(self, apsimx_dir):
+        return {
+            "apsimx_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1900, month=1, day=1),
+            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "exclusive": False,
+            "num_levels": 0,
+        }
+
+    @pytest.fixture(params=[
+        {
+            "nitrogen": np.array([0.5]),
+            "irrigate": np.array([0.5]),
+        },
+    ])
+    def action_id(self, request):
+        r"""int: Action ID."""
+        return request.param
+
+    @pytest.fixture(params=[
+        0,
+        (1, np.array([0.5])),
+        np.zeros((5, )),
+    ])
+    def invalid_action_id(self, request):
+        r"""int: Action ID."""
+        return request.param

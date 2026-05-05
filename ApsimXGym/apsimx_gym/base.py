@@ -1,14 +1,21 @@
 import os
+import re
 import copy
+import pprint
 import datetime
 import contextlib
 from collections import defaultdict
 from abc import ABC, ABCMeta, abstractmethod
-from typing import Optional, Union, Dict, List
+from typing import Optional, Union, Dict, List, Tuple, Any, Callable
 from functools import cached_property
 import numpy as np
 import gymnasium as gym
 from . import logger
+
+
+class NoDefault:
+    r"""Dummy class for defaults."""
+    pass
 
 
 class RecoverableError(RuntimeError):
@@ -31,22 +38,1277 @@ class InvalidActionError(RecoverableError):
     pass
 
 
-class BaseModelFile(ABC):
+def readonly_cached_property(method: Callable):
+    r"""Decorator for a read-only cached property.
+
+    Args:
+        method: Method to wrap.
+
+    """
+
+    name = method.__qualname__.rsplit('.', 1)[-1]
+
+    @property
+    def _readonly_cached_property(self):
+        if name not in self._cached_properties:
+            self._cached_properties[name] = method(self)
+        return self._cached_properties[name]
+
+    return _readonly_cached_property
+
+
+class CachedPropertyMixin:
+    r"""Mixin class for enabling read-only cached properties."""
+
+    def __init__(self, *args, **kwargs):
+        self._cached_properties = {}
+        super().__init__(*args, **kwargs)
+
+    def _clear_cached_property(self, name: str):
+        self._cached_properties.pop(name, None)
+
+    def _clear_cached_properties(self):
+        self._cached_properties.clear()
+
+
+class ModelAction(CachedPropertyMixin):
+    r"""Wrapper for a model action.
+
+    Args:
+        name: Action name.
+        alias: Action alias.
+        keywords: Key words or phrases identifying this action.
+        cost: Action cost. If the action produces a float, this should be
+            the cost per action unit.
+        action_param: Parameter that action will set.
+        num_levels: Number of levels that the action supports for the
+            action parameter. 0 indicates a continuous action, -1
+            indicates a boolean action.
+        level: Explicit levels for the action parameter.
+        bounds: Explicit bounds for the action parameter (numbers only).
+        param_desc: Descriptions of parameters supported by the action.
+        param: Values for additional parameters that should be used.
+        allow_donothing: If True, the action should allow for a choice to
+            do nothing.
+        offset: Action offset when part of a discrete set.
+
+    """
+    ACTION_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},
+            "alias": {"type": "string"},
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "cost": {"type", "number"},
+            "action_param": {
+                "type": ["string", "null"],
+            },
+            "num_levels": {"type": "integer"},
+            "levels": {
+                "type": "array",
+                "items": {"type": ["number", "string"]},
+            },
+            "bounds": {
+                "type": "array",
+                "items": [{"type": "number"}, {"type": "number"}],
+            },
+            "param_desc": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",  # "schema" for yggdrasil_rapidjson
+                    "properties": {
+                        "type": {"type": "string"},
+                        "enum": {"type": "array"},
+                        "min": {"type": "number"},
+                        "max": {"type": "number"},
+                        "units": {"type": "string"},
+                        "ndim": {"type": "integer"},
+                        "dtype": {"type": "string"},
+                    },
+                },
+            },
+            "param": {"type": "object"},
+        },
+        "additionalProperties": False,
+        "required": ["description", "action_param", "num_levels"],
+    }
+
+    def __init__(
+            self,
+            name: str, description: str,
+            alias: Optional[str] = None,
+            keywords: Optional[List[str]] = None,
+            cost: Optional[float] = None,
+            action_param: Optional[str] = None,
+            num_levels: Optional[int] = 0,
+            levels: Optional[List[Union[str, float, np.ndarray]]] = None,
+            bounds: Optional[Union[Tuple[float, float],
+                                   Tuple[np.ndarray, np.ndarray]]] = None,
+            param_desc: Optional[dict] = None,
+            param: Optional[dict] = None,
+            allow_donothing: Optional[bool] = True,
+            offset: Optional[int] = 0,
+    ):
+        self.name = name
+        self.description_fstring = description
+        self.alias = alias
+        self.keywords = keywords.copy() if keywords else []
+        self.cost = cost
+        self.action_param = action_param
+        self.action_param_desc = None
+        self.param_desc = param_desc or {}
+        self.param = {}
+        self.allow_donothing = allow_donothing
+        self.offset = offset
+        self.num_levels = len(levels) if levels else num_levels
+        if self.num_levels != -1:
+            assert action_param is not None
+            self.action_param_desc = self.param_desc[action_param]
+            if "enum" in self.action_param_desc and levels is None:
+                levels = self.action_param_desc["enum"]
+                self.num_levels = len(levels)
+        self._levels = levels
+        self._bounds = bounds
+        if param:
+            self.set_param(param)
+        super().__init__()
+
+    @readonly_cached_property
+    def additional_param(self):
+        r"""list: Set of additional parameters."""
+        return [k for k in self.param_desc.keys()
+                if k != self.action_param]
+
+    @readonly_cached_property
+    def additional_param_args(self) -> list:
+        r"""Set of additional parameter arguments."""
+        if not self.param:
+            return []
+        out = [self.param.get(k, None)
+               for k in self.additional_param]
+        while out[-1] is None:
+            out = out[:-1]
+        if None in out:
+            idx_first = out.index(None)
+            missing = [
+                self.additional_param[i - 1]
+                for i, x in enumerate(out) if x is None
+            ]
+            later = [
+                self.additional_param[i - 1]
+                for i, x in enumerate(out)
+                if x is not None and i > idx_first
+            ]
+            raise InvalidActionError(
+                f"Missing optional parameters ({missing}) "
+                f"required to be able to provide those "
+                f"that occur later in the order ({later})"
+            )
+        return out
+
+    @readonly_cached_property
+    def bounds(self):
+        r"""tuple: Minimum and maximum bounds for action value."""
+        if self._bounds:
+            return self._bounds
+        if self.num_levels == -1:
+            return None
+        if not self.numeric:
+            return None
+        if self._bounds:
+            xmin, xmax = self._bounds[:]
+        else:
+            xmin = self.action_param_desc.get("min", -np.inf)
+            xmax = self.action_param_desc.get("max", np.inf)
+        le = xmin
+        re = xmax
+        if not isinstance(le, np.ndarray):
+            le = np.empty(self.shape, dtype=self.dtype)
+            le.fill(xmin)
+        if not isinstance(re, np.ndarray):
+            re = np.empty(self.shape, dtype=self.dtype)
+            re.fill(xmax)
+        return (le, re)
+
+    @readonly_cached_property
+    def levels(self):
+        r"""list: Set of discrete levels for the action."""
+        if self._levels:
+            return self._levels
+        if self.num_levels == 0 or self.num_levels == -1:
+            return None
+        if any(any(x == -np.inf) or any(x == np.inf)
+               for x in self.bounds):
+            raise InvalidActionError(
+                f"Error parsing description of action \"{self.name}\". "
+                f"Cannot create discrete levels for an infinite "
+                f"action space. The bounds for action space parameter "
+                f"\"{self.action_param}\" are {self.bounds}."
+            )
+        if (not self.allow_donothing) and all(self.bounds[0] == 0):
+            out = np.linspace(
+                self.bounds[1] / self.num_levels,
+                self.bounds[1], self.num_levels
+            ).tolist()
+        else:
+            out = np.linspace(
+                self.bounds[0], self.bounds[1], self.num_levels
+            ).tolist()
+        return [
+            np.array(x, dtype=self.dtype)
+            for x in out
+        ]
+
+    @readonly_cached_property
+    def numeric(self) -> bool:
+        r"""bool: True if the action is numeric."""
+        return (self.action_param_desc
+                and self.action_param_desc["type"] == "number")
+
+    @readonly_cached_property
+    def ndim(self) -> int:
+        r"""int: Number of dimensions in the action parameter."""
+        if not self.numeric:
+            return None
+        return self.action_param_desc.get("ndim", 1)
+
+    @property
+    def shape(self) -> tuple:
+        r"""tuple: Shape of action parameter."""
+        return (self.ndim, )
+
+    @readonly_cached_property
+    def dtype(self) -> type:
+        r"""dtype: Data type of the action parameter."""
+        if not self.numeric:
+            return None
+        return self.action_param_desc.get("dtype", np.float64)
+
+    @readonly_cached_property
+    def choices(self) -> list:
+        r"""list: Set of choices."""
+        if self.num_levels == 0:
+            return []
+        elif self.num_levels == -1:
+            return [False, True] if self.allow_donothing else [True]
+        # TODO: Add do nothing case for strings?
+        return self.levels
+
+    def set_param(self, param: dict):
+        r"""Update the action parameters.
+
+        Args:
+            param: Action parameters.
+
+        """
+        self.param = param.copy()
+        for k, v in self.param_desc.items():
+            if ((k not in self.param and k != self.action_param
+                 and "default" in v)):
+                self.param[k] = v["default"]
+        assert self.action_param not in self.param
+        self._clear_cached_properties()
+
+    def scale_action_amounts(self, scale: Union[int, float]):
+        r"""Scale action limits/levels.
+
+        Args:
+            scale: Amount to scale values by.
+
+        """
+        assert self.numeric
+        if self._levels:
+            self._levels = [scale * x for x in self._levels]
+        else:
+            self._bounds = (self.bounds[0], scale * self.bounds[1])
+        self._clear_cached_properties()
+
+    @property
+    def num_choices(self) -> int:
+        r"""int: Number of discrete choices allowed for this action."""
+        return len(self.choices)
+
+    @property
+    def discrete(self) -> bool:
+        r"""bool: True if the action is discrete."""
+        return (self.num_levels != 0)
+
+    @property
+    def boolean(self) -> bool:
+        r"""bool: True if the action is boolean."""
+        return (self.num_levels == -1)
+
+    @readonly_cached_property
+    def example_value(self):
+        r"""object: Example action value."""
+        if self.num_levels == 0:
+            for x in self.bounds[::-1]:
+                if not (any(x == -np.inf) or any(x == np.inf)):
+                    return x
+            return 0.0
+        elif self.num_levels == -1:
+            return True
+        return self.levels[-1]
+
+    @readonly_cached_property
+    def example_args(self) -> tuple:
+        r"""tuple: Example action args."""
+        return self.value2args(self.example_value)
+
+    @readonly_cached_property
+    def example_description(self) -> str:
+        r"""str: Example action description."""
+        return self.format_description(value=self.example_value)
+
+    @readonly_cached_property
+    def description(self) -> str:
+        r"""str: Description of the action set."""
+        return self.format_description()
+
+    @readonly_cached_property
+    def description_regex(self) -> str:
+        r"""str: Regex string for parsing descriptions."""
+        return self.format_description_regex()
+
+    @readonly_cached_property
+    def space(self) -> gym.spaces.space.Space:
+        r"""gym.spaces.space.Space: Action space."""
+        if self.num_levels == 0:
+            return gym.spaces.Box(
+                shape=self.shape,
+                dtype=self.dtype,
+                low=self.bounds[0],
+                high=self.bounds[1],
+            )
+        return gym.spaces.Discrete(self.num_choices)
+
+    def combine_args_and_kwargs(self, args: tuple, kwargs: dict) -> dict:
+        r"""Combine positional and keyword arguments into a single dict
+        for the action based on the available action parameters.
+
+        Args:
+            args: Positional arguments.
+            kwargs: Keyword arguments.
+
+        Returns:
+            dict: Combined keyword arguments.
+
+        """
+        if len(args) > len(self.param_desc):
+            raise InvalidActionError(
+                f"Tool many ({len(args)}) parameters provided for "
+                f"action ({self.name}). Valid parameters: "
+                f"{list(self.param_desc.keys())}")
+        kws = {}
+        for k, v in kwargs.items():
+            if k not in self.param_desc:
+                raise InvalidActionError(
+                    f"Invalid parameter \"{k}\" provided for action "
+                    f"\"{self.name}\". Valid parameters: "
+                    f"{list(self.param_desc.keys())}")
+            kws[k] = v
+        for k, v in zip(self.param_desc.keys(), args):
+            if k in kws:
+                raise InvalidActionError(
+                    f"\"{k}\" parameter for action \"{self.name}\" "
+                    f"provided as both a positional and keyword "
+                    f"argument")
+            kws[k] = v
+        for k, v in self.param.items():
+            kws.setdefault(k, v)
+        # TODO: Validate param against schema?
+        # for k, v in kws.items():
+        #     rj.validate(self.param_desc[k], v)
+        return kws
+
+    def args2cost(self, args: tuple):
+        r"""Convert a set of action arguments to the action cost.
+
+        Args:
+            args: Action arguments.
+
+        Returns:
+            float: Cost of the action.
+
+        """
+        # TODO: Allow different costs for different string choices or
+        #   optional param?
+        if self.cost is None:
+            return 0.0
+        if not (self.action_param_desc
+                and self.action_param_desc["type"] == "number"):
+            return self.cost
+        return self.cost * args[0]
+
+    def description2action(self, description: str):
+        r"""Parse a description to get an action ID.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            object: Action ID.
+
+        """
+        return self.value2action(self.description2value(description))
+
+    def search_description(self, description: str) -> re.Match:
+        r"""Search a description for a match to this action using regex.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            re.Match: Search result.
+
+        """
+        return re.search(self.description_regex, description)
+
+    def fuzzy_search_description(self, description: str):
+        r"""Search a description for a match to this action by looking
+        for keywords.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            object: Value from fuzzy search.
+
+        """
+        desc = description.lower()
+        if self.numeric and (self.name.lower() in desc
+                             or any(k.lower() in desc
+                                    for k in self.keywords)):
+            amount_match = re.search(r"(\d+\.?\d*)", description)
+            if amount_match:
+                return self.dtype(amount_match.group(1))
+        raise InvalidActionError(f"Failed to parse description "
+                                 f"via fuzzy search: "
+                                 f"\"{description}\"")
+
+    def match2value(self, match: re.Match):
+        r"""Convert a regex search result into an action value.
+
+        Args:
+            match: Regex search result.
+
+        Returns:
+            object: Action value.
+
+        """
+        if match:
+            if self.boolean:
+                return True
+            value = match.groupdict()[self.action_param]
+            if self.numeric:
+                if self.ndim == 1:
+                    value = self.dtype(value)
+                else:
+                    value = np.array([
+                        self.dtype(x) for x in
+                        value.strip("[").strip("]").split(",")
+                    ])
+            return value
+        if self.boolean and False in self.choices:
+            return False
+        raise InvalidActionError("No match")
+
+    def description2value(self, description: str):
+        r"""Parse a description for a action value.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            object: Action value.
+
+        """
+        match = self.search_description(description)
+        if match:
+            return self.match2value(match)
+        raise InvalidActionError(f"Failed to parse description "
+                                 f"via regex: \"{description}\"")
+
+    def value2action(self, value):
+        r"""Convert an action value into an action ID.
+
+        Args:
+            value: Action value.
+
+        Returns:
+            int, np.ndarray: Action ID.
+
+        """
+        if self.num_levels == 0:
+            if not isinstance(value, np.ndarray):
+                value = np.array([value], dtype=self.dtype)
+            assert value.shape == self.shape
+            assert value.dtype == self.dtype
+            return value
+        if value in self.choices:
+            return self.choices.index(value) + self.offset
+        if isinstance(value, (float, int, np.ndarray)) and self.numeric:
+            diff = np.array(self.choices) - value
+            diff = (
+                np.abs(diff) if self.ndim == 1
+                else np.linalg.norm(diff, axis=1)
+            )
+            assert len(diff) == self.ndim
+            return self.offset + np.argmin(diff)
+        raise InvalidActionError(f"{value} is not a valid choice")
+
+    def action2value(self, action: Union[int, np.ndarray]):
+        r"""Convert an action ID into a parameter value.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            object: Parameter value.
+
+        """
+        if self.num_levels == 0:
+            if not isinstance(action, np.ndarray):
+                raise InvalidActionError(
+                    f"Continuous action {self.name} requires a "
+                    f"np.ndarray action ID, not {type(action)}"
+                 )
+            if action.dtype != self.dtype:
+                raise InvalidActionError(
+                    f"Continuous action {self.name} requires a "
+                    f"np.ndarray action ID with dtype {self.dtype}, "
+                    f"not {action.dtype}"
+                )
+            if action.shape != self.shape:
+                raise InvalidActionError(
+                    f"Continuous action {self.name} requires a "
+                    f"np.ndarray action ID "
+                    f"with shape {self.shape}, not {action.shape}"
+                )
+            return action
+        if not isinstance(action, (int, np.integer)):
+            raise InvalidActionError(
+                f"Discrete action {self.name} requires an integer "
+                f"action ID, not {type(action)}"
+            )
+        action_rel = action - self.offset
+        if action_rel < 0 or action_rel >= self.num_choices:
+            raise InvalidActionError(
+                f"Discrete action {self.name} requires an integer "
+                f"with the range [{self.offset}, "
+                f"{self.offset + self.num_choices}), "
+                f"not {action}"
+            )
+        return self.choices[action_rel]
+
+    def value2args(self, value) -> tuple:
+        r"""Convert an action value to arguments.
+
+        Args:
+            value: Action value.
+
+        Returns:
+            tuple: Action arguments.
+
+        """
+        if self.boolean:
+            assert value is True
+            return tuple([] + self.additional_param_args)
+        if self.numeric and isinstance(value, np.ndarray):
+            return tuple(value.tolist() + self.additional_param_args)
+        return tuple([value] + self.additional_param_args)
+
+    def action2description(self, action) -> str:
+        r"""Convert an action ID into a natural language description.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            str: Action description.
+
+        """
+        return self.format_description(value=self.action2value(action))
+
+    def action2args(self, action) -> tuple:
+        r"""Convert an action ID into arguments that can be passed to
+        BaseModelEngine.act.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            tuple: Parameter act arguments.
+
+        """
+        return self.value2args(self.action2value(action))
+
+    @classmethod
+    def _format_value(cls, value) -> str:
+        if isinstance(value, str):
+            return value
+        elif isinstance(value, float):
+            return f"{value:.1f}"
+        elif isinstance(value, list):
+            return cls._format_choice_list(value)
+        elif isinstance(value, np.ndarray):
+            if len(value) == 1:
+                return cls._format_value(value[0])
+            return (
+                "[" + ", ".join(cls._format_value(x) for x in value)
+                + "]"
+            )
+        raise NotImplementedError(type(value))
+
+    @classmethod
+    def _format_choice_list(cls, values: list) -> str:
+        if not values:
+            return ""
+        values = [cls._format_value(v) for v in values]
+        if len(values) == 1:
+            return values[0]
+        if len(values) == 2:
+            return f"{values[0]} or {values[1]}"
+        return f"{', '.join(values[:-1])}, or {values[-1]}"
+
+    def format_description(
+            self, value=None,
+            param: Optional[dict] = None,
+    ) -> str:
+        r"""Format a description of the action.
+
+        Args:
+            value: Action value to include in the description.
+            param: Alternate action parameter values to include in the
+                description.
+
+        Returns:
+            str: Formatted action description.
+
+        """
+        if value is None:
+            if self.num_levels == 0:
+                if self.ndim == 1:
+                    value = f"{self.bounds[0][0]} to {self.bounds[1][0]}"
+                else:
+                    value = f"{self.bounds[0]} to {self.bounds[1]}"
+            elif self.num_levels == -1:
+                value = True
+            else:
+                value = self.levels
+        kws = dict(self.param, **(param or {}))
+        if self.num_levels == -1:
+            if value is False:
+                return ""
+            assert value in [None, True]
+        else:
+            kws.setdefault(self.action_param, value)
+        for k, v in self.param_desc.items():
+            if "units" in v:
+                kws.setdefault(f"{k}_units", v["units"])
+            kws.setdefault(k, v.get("default", ""))
+        out = self.description_fstring.format(**{
+            k: self._format_value(v)
+            for k, v in kws.items()
+        })
+        while "  " in out:
+            out = out.replace("  ", " ")  # Collapse extra whitespace
+        if not out.endswith("."):
+            out += "."
+        return out
+
+    @classmethod
+    def _param2regex(cls, desc: dict) -> str:
+        if desc["type"] == "string":
+            if "enum" in desc:
+                return "|".join(f"(?:{x})" for x in desc["enum"])
+            return ".+?"
+        elif desc["type"] == "number":
+            out = r"\d+(?:\.\d+)?"
+            ndim = desc.get("ndim", 1)
+            if ndim > 1:
+                out = r"\[\s*" + r"\s*\,\s*".join(ndim * [out]) + r"\s*\]"
+            return out
+        raise NotImplementedError(
+            f"Regex for parameter type {desc['type']}")
+
+    def format_description_regex(
+            self,
+            param: Optional[dict] = None,
+            param_regex: Optional[dict] = None,
+    ) -> str:
+        r"""Create a regex string for extracting parameters from an
+        action description.
+
+        Args:
+            param: Parameter values that should be included in the
+                description regex as constants.
+            param_regex: Regex strings for parameters that should be
+                matched in the description regex.
+
+        Returns:
+            str: Description regex.
+
+        """
+        param = dict(
+            self.param, **(param.copy() if param is not None else {})
+        )
+        param_regex = param_regex.copy() if param_regex else {}
+        placeholders = {}
+        for k, v in self.param_desc.items():
+            if k in param or k in param_regex:
+                continue
+            param_regex[k] = self._param2regex(v)
+        for k, v in param_regex.items():
+            kph = k.upper()
+            assert kph not in self.description_fstring
+            placeholders[kph] = '(?P<' + k + '>' + v + ')'
+            param[k] = kph
+        out = re.escape(self.format_description(param=param))
+        for k, v in placeholders.items():
+            out = out.replace(k, v)
+        return out
+
+    @readonly_cached_property
+    def constraint(self) -> str:
+        r"""str: String describing any constraints."""
+        out = ""
+        if self.num_levels == 0:
+            cond = []
+            # TODO: Better handling of ndim > 1
+            if any(self.bounds[0] != -np.inf):
+                le = self.bounds[0][0] if self.ndim == 1 else self.bounds[0]
+                cond.append(f"greater than {le}")
+            if any(self.bounds[1] != np.inf):
+                re = self.bounds[1][0] if self.ndim == 1 else self.bounds[1]
+                cond.append(f"less than {re}")
+            if len(cond) == 1:
+                out = f"must be {cond[0]}"
+            elif len(cond) == 2:
+                out = f"must be {cond[0]} and {cond[1]}"
+            return out
+        elif self.num_levels == -1:
+            pass
+        else:
+            out = (
+                "must be one of "
+                + self._format_choice_list(self.levels)
+            )
+        return out
+
+
+class DoNothingModelAction(ModelAction):
+    r"""Specific case of a model action to do nothing."""
+
+    def __init__(
+            self,
+            name: Optional[str] = "donothing",
+            description: Optional[str] = "Do nothing.",
+            keywords: Optional[list] = [
+                "do nothing", "take no action"
+            ]):
+        super().__init__(
+            name,
+            description=description,
+            num_levels=-1,
+            allow_donothing=False,
+            keywords=keywords,
+        )
+
+
+class ModelActionSet(CachedPropertyMixin):
+    r"""Set of model actions.
+
+    Args:
+        action_map: Mapping between action names and descriptions.
+        num_levels: Number of levels per action if not specified in
+            action_map (0 for continuous, -1 for boolean).
+        allow_donothing: Include non-action as a possible action.
+        exclusive: Don't allow more than one action per step.
+        default_action_map: Mapping of default action descriptions that
+            should be used to fill in missing information in action_map.
+        param: Action parameters to use keyed to action names.
+
+    """
+
+    def __init__(
+            self, action_map: dict,
+            num_levels: Optional[int] = 0,
+            allow_donothing: Optional[bool] = True,
+            exclusive: Optional[bool] = True,
+            default_action_map: Optional[dict] = None,
+            param: Optional[dict] = None,
+    ):
+        self.actions = {}
+        self.num_levels = num_levels
+        self.allow_donothing = allow_donothing
+        self.exclusive = exclusive
+        if self.exclusive and self.allow_donothing:
+            self.actions[""] = DoNothingModelAction()
+        self.action_allow_donothing = (
+            self.allow_donothing and (not self.exclusive)
+        )
+        default_action_map = default_action_map or {}
+        param = param or {}
+        for action, desc in action_map.items():
+            if isinstance(desc, ModelAction):
+                self.actions[action] = desc
+                continue
+            kws = desc.copy()
+            kws.setdefault("num_levels", self.num_levels)
+            if action in default_action_map:
+                for k, v in default_action_map[action].items():
+                    kws.setdefault(k, v)
+            if action in param:
+                kws["param"] = param["action"]
+            self.actions[action] = ModelAction(
+                action, allow_donothing=self.action_allow_donothing,
+                **kws)
+        super().__init__()
+        self._on_edit_actions(in_init=True)
+
+    @classmethod
+    def create(cls, action_map: Union["ModelActionSet", dict],
+               **kwargs) -> "ModelActionSet":
+        r"""Create a ModelActionSet from a dictionary. If an existing
+        ModelActionSet instance is provided, it is returned.
+
+        Args:
+            action_map: Existing ModelActionSet or dictionary.
+            **kwargs: Additional keyword arguments are passed to the
+                constructor if action_map is not a ModelActionSet
+                instance.
+
+        Returns:
+            ModelActionSet instance.
+
+        """
+        if isinstance(action_map, ModelActionSet):
+            # for k, v in kwargs.items():
+            #     assert getattr(action_map, k, None) == v
+            return action_map
+        return cls(action_map, **kwargs)
+
+    def __getitem__(self, k):
+        return self.actions[k]
+
+    def __contains__(self, k):
+        return k in self.actions
+
+    def items(self):
+        r"""Action items."""
+        return self.actions.items()
+
+    def keys(self):
+        r"""Action keys."""
+        return self.actions.keys()
+
+    def values(self):
+        r"""Action values."""
+        return self.actions.values()
+
+    def pop(self, k, default=NoDefault):
+        r"""Remove an action."""
+        if k in self.actions:
+            out = self.actions.pop(k)
+            self._on_edit_actions()
+            return out
+        if default is NoDefault:
+            raise KeyError(k)
+        return default
+
+    def _on_edit_actions(self, in_init=False):
+        if self.exclusive and self.discrete:
+            nprev = 0
+            for desc in self.actions.values():
+                desc.offset = nprev
+                nprev += desc.num_choices
+        if in_init:
+            return
+        self._clear_cached_properties()
+
+    def set_param(self, param: dict):
+        r"""Update the action parameters.
+
+        Args:
+            param: Action parameters.
+
+        """
+        if not param:
+            return
+        for k, v in param.items():
+            self.actions[k].set_param(v)
+        self._on_edit_actions()
+
+    def scale_action_amounts(self, scale: Union[int, float]):
+        r"""Scale action limits/levels.
+
+        Args:
+            scale: Amount to scale values by.
+
+        """
+        updated = False
+        for v in self.actions.values():
+            if not v.numeric:
+                continue
+            v.scale_action_amounts(scale)
+            updated = True
+        if updated:
+            self._on_edit_actions()
+
+    @readonly_cached_property
+    def action_order(self) -> list:
+        r"""list: Order of actions for indexing."""
+        if self.exclusive and self.discrete:
+            out = []
+            for name, desc in self.actions.items():
+                out += desc.num_choices * [name]
+            return out
+        return list(self.actions.keys())
+
+    @readonly_cached_property
+    def num_choices(self) -> int:
+        r"""int: Number of discrete choices allowed for this action."""
+        return sum(x.num_choices for x in self.actions.values())
+
+    @readonly_cached_property
+    def ndim(self) -> int:
+        r"""int: Number of dimensions."""
+        return sum(
+            1 if x.discrete else x.ndim
+            for x in self.actions.values()
+        )
+
+    @readonly_cached_property
+    def discrete(self) -> bool:
+        r"""bool: True if the action is discrete."""
+        return all(x.discrete for x in self.actions.values())
+
+    @readonly_cached_property
+    def donothin_action(self):
+        r"""object: Action ID to do nothing."""
+        if not self.allow_donothing:
+            return None
+        if not self.exclusive:
+            return {}
+        if self.discrete:
+            return 0
+        return (0, 0)
+
+    @readonly_cached_property
+    def example_value(self):
+        r"""object: Example action value."""
+        if self.exclusive:
+            last = self.actions[self.action_order[-1]]
+            return {last.name: last.example_value}
+        return {
+            k: v.example_value for k, v in self.actions.items()
+        }
+
+    @readonly_cached_property
+    def example_args(self) -> dict:
+        r"""dict: Example action args."""
+        return self.value2args(self.example_value)
+
+    @readonly_cached_property
+    def example_description(self) -> str:
+        r"""str: Example action description."""
+        return self.format_description(value=self.example_value)
+
+    @readonly_cached_property
+    def description_lines(self) -> list:
+        r"""list: Lines describing the action set."""
+        return self.format_description(return_lines=True)
+
+    @readonly_cached_property
+    def description(self) -> str:
+        r"""str: Description of the action set."""
+        return "\n".join(self.description_lines)
+
+    @readonly_cached_property
+    def space(self) -> gym.spaces.space.Space:
+        r"""gym.spaces.space.Space: Action space."""
+        if self.exclusive:
+            if self.discrete:
+                return gym.spaces.Discrete(self.num_choices)
+            else:
+                return gym.spaces.OneOf([
+                    desc.space for desc in self.actions.values()
+                ])
+        return gym.spaces.Dict({
+            action: desc.space
+            for action, desc in self.actions.items()
+        })
+
+    def description2action(self, description: str):
+        r"""Parse a description to get an action ID.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            object: Action ID.
+
+        """
+        return self.value2action(self.description2value(description))
+
+    def description2value(self, description: str):
+        r"""Parse a description for a action value.
+
+        Args:
+            description: Action description.
+
+        Returns:
+            dict: Action value map.
+
+        """
+        out = {}
+        for k, v in self.actions.items():
+            match = v.search_description(description)
+            if not match:
+                continue
+            out[k] = v.match2value(match)
+            if self.exclusive:
+                return out
+            description = (
+                description[:match.start(0)] + description[match.end(0):]
+            ).strip()
+            if not description:
+                break
+        if (not description) and (not self.exclusive):
+            return out
+        parts = (
+            [description] if self.exclusive
+            else [x + '.' for x in description.split('.')]
+        )
+        matches = [{} for _ in parts]
+        for i, description in enumerate(parts):
+            for k, v in self.actions.items():
+                if k in out:
+                    continue
+                try:
+                    matches[i][k] = v.fuzzy_search_description(
+                        description)
+                except InvalidActionError:
+                    continue
+        errors = []
+        for k in self.actions.keys():
+            idx = [i for i, match in enumerate(matches)
+                   if k in match]
+            if len(idx) > 1:
+                errors.append(
+                    f"Action \"{k}\" matched more than one part of "
+                    f"the description:\n    "
+                    + "\n    ".join(f"\"{parts[i]}\"" for i in idx)
+                )
+        for i, match in enumerate(matches):
+            if len(match) == 0:
+                errors.append(
+                    f"No action matches this part of the description "
+                    f"\"{parts[i]}\""
+                )
+            elif len(match) == 1:
+                out.update(match)
+            else:
+                errors.append(
+                    f"More than one action {list(match.keys())} "
+                    f"matches the same part of the description: "
+                    f"\"{parts[i]}\""
+                )
+        if errors:
+            raise InvalidActionError(
+                "Failed to parse description:\n  - "
+                + "\n  - ".join(errors))
+        return out
+
+    def value2action(self, value: dict):
+        r"""Convert an action value into an action ID.
+
+        Args:
+            value: Action value map.
+
+        Returns:
+            int, tuple, dict: Action ID.
+
+        """
+        action = {
+            k: self.actions[k].value2action(v)
+            for k, v in value.items()
+        }
+        if not self.exclusive:
+            return action
+        assert len(value) == 1
+        name, action = list(action.items())[0]
+        if self.discrete:
+            return action
+        else:
+            return (self.action_order.index(name), action)
+
+    def action2value(self, action: Union[int, tuple, dict, np.ndarray]):
+        r"""Convert an action ID into a map of action values.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            dict: Action value map.
+
+        """
+        if self.exclusive:
+            if self.discrete:
+                if not isinstance(action, (int, np.integer)):
+                    raise InvalidActionError(
+                        f"An exclusive, discrete set of actions "
+                        f"requires an integer action ID, not "
+                        f"{type(action)}"
+                    )
+                name = self.action_order[action]
+                action = {name: action}
+            else:
+                if not isinstance(action, tuple):
+                    raise InvalidActionError(
+                        f"An exclusive, mixed (discrete & continous) "
+                        f"set of actions requires a tuple action ID, "
+                        f"not {type(action)}"
+                    )
+                name = self.action_order[action[0]]
+                action = {name: action[1]}
+        if isinstance(action, np.ndarray):
+            if len(action) != self.ndim:
+                raise InvalidActionError(
+                    f"A non-exclusive set of actions requires a "
+                    f"np.ndarray action ID with {self.ndim} "
+                    f"elements, not {len(action)}"
+                )
+            out = {}
+            pos = 0
+            for k, v in self.action.items():
+                if v.discrete:
+                    x = action[pos]
+                    pos += 1
+                else:
+                    x = action[pos:(pos + v.ndim)]
+                    pos += v.ndim
+                out[k] = v.action2value(x)
+            return out
+        if not isinstance(action, dict):
+            raise InvalidActionError(
+                f"A non-exclusive set of actions requires a dict "
+                f"action ID, not {type(action)}"
+            )
+        return {
+            k: self.actions[k].action2value(v)
+            for k, v in action.items()
+        }
+
+    def value2args(self, value: dict) -> Dict[str, tuple]:
+        r"""Convert an action value map to an argument map.
+
+        Args:
+            value: Action value.
+
+        Returns:
+            dict: Action argument map.
+
+        """
+        out = {}
+        for k, v in value.items():
+            if self.actions[k].boolean and v is False:
+                continue
+            if isinstance(self.actions[k], DoNothingModelAction):
+                continue
+            out[k] = self.actions[k].value2args(v)
+        return out
+
+    def action2description(
+            self, action: Union[int, tuple, dict, np.ndarray]) -> str:
+        r"""Convert an action ID into a natural language description.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            str: Action description.
+
+        """
+        return self.format_description(value=self.action2value(action))
+
+    def action2args(
+            self, action: Union[int, tuple, dict, np.ndarray]) -> dict:
+        r"""Convert an action ID into a parameter argument map for
+        actvars.
+
+        Args:
+            action: Action ID.
+
+        Returns:
+            dict: Parameter to argument map.
+
+        """
+        return self.value2args(self.action2value(action))
+
+    def format_description(
+            self, value: Optional[dict] = None,
+            return_lines: Optional[bool] = False,
+    ) -> str:
+        r"""Format a description of the action.
+
+        Args:
+            value: Action value to include in the description.
+            return_lines: If True, return a list of lines instead of a
+                merged string.
+
+        Returns:
+            str: Formatted action description. A list will be returned
+                if return_lines is True.
+
+        """
+        lines = []
+        if value is None:
+            if self.exclusive:
+                lines.append(
+                    "Available actions (pick exactly one):")
+            else:
+                lines.append(
+                    "Available actions (include instructions for each):")
+            lines += [
+                "- " + v.format_description()
+                for v in self.actions.values()
+            ]
+        else:
+            if self.exclusive:
+                assert len(value) == 1
+            lines += [
+                self.actions[k].format_description(value=v)
+                for k, v in value.items()
+            ]
+            lines = [" ".join(lines)]  # Multiple actions
+        return lines if return_lines else "\n".join(lines)
+
+
+class BaseModelFile(CachedPropertyMixin, ABC):
     r"""Base class for managing model input files.
 
     Args:
         fname: Path to a model file.
         generated: If True, this file was generated.
         contents: Contents to initialize the file with.
+        fname_orig: Original model file that this one was generated from.
 
     """
 
     def __init__(self, fname: str, generated: Optional[bool] = False,
-                 contents: Optional[dict] = None):
+                 contents: Optional[dict] = None,
+                 fname_orig: Optional[str] = None):
         self.fname = fname
+        self.fname_orig = fname_orig or fname
         self.generated = generated
         if contents:
             self.contents = contents
+        super().__init__()
 
     def __del__(self):
         self.cleanup()
@@ -56,6 +1318,7 @@ class BaseModelFile(ABC):
         if self.generated and self.exists:
             os.remove(self.fname)
             self.generated = False
+            self._clear_cached_properties()
 
     @classmethod
     @abstractmethod
@@ -83,21 +1346,129 @@ class BaseModelFile(ABC):
         """
         raise NotImplementedError  # pragma: no cover
 
+    def _get(self, name: str):
+        r"""Get a parameter from the model file.
+
+        Args:
+            name: Parameter name.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        raise KeyError(name)
+
+    def _set(self, name: str, value: Any) -> Any:
+        r"""Set a parameter in the model file.
+
+        Args:
+            name: Parameter name.
+            value: Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        raise KeyError(name)
+
+    @staticmethod
+    def parameter_property(method: Callable):
+        r"""Decorator for a BaseModelFile method that produces the default
+        value that should be used if a KeyError is not raised by
+        BaseModelFile.get(<property name>).
+
+        Args:
+            method: BaseModelFile method being wrapped.
+
+        """
+
+        name = method.__qualname__.rsplit('.', 1)[-1]
+
+        @property
+        def _parameter_property(self):
+            try:
+                return self.get(name)
+            except KeyError:
+                self._cached_properties[name] = method(self)
+                return self._cached_properties[name]
+
+        return _parameter_property
+
     @cached_property
     def contents(self):
         r"""object: File contents."""
         return self._read(self.fname)
 
-    @cached_property
+    @readonly_cached_property
     @abstractmethod
     def is_interactive(self):
         r"""bool: True if the model file is interactive."""
         raise NotImplementedError  # pragma: no cover
 
+    @contextlib.contextmanager
+    def prevent_overwrite(self, suffix: Optional[str] = "-Modified"):
+        r"""Context to ensure that a duplicate is made if the context
+        exits successfully during modification of the file contents.
+
+        Args:
+            suffix: File suffix to add if a new file name is generated.
+
+        """
+        assert self.contents  # Ensure contents loaded
+        yield
+        if self.exists:
+            self.move(suffix=suffix)
+        self.generated = False
+        self._clear_cached_properties()
+
+    @parameter_property
+    def output_vars(self):
+        r"""list: Output variables."""
+        return []
+
     @property
     def exists(self):
         r"""bool: True if the file exists."""
         return os.path.isfile(self.fname)
+
+    def get(self, name: str, default=NoDefault):
+        r"""Get a parameter from the model file.
+
+        Args:
+            name: Parameter name.
+            default: Value to return if the parameter can't be found.
+
+        Returns:
+            Parameter value.
+
+        """
+        if name in self._cached_properties:
+            return self._cached_properties[name]
+        try:
+            out = self._get(name)
+            self._cached_properties[name] = out
+            return out
+        except KeyError:
+            if default is not NoDefault:
+                return default
+            raise
+
+    def set(self, name: str, value: Any) -> Any:
+        r"""Set a parameter in the model file.
+
+        Args:
+            name: Parameter name.
+            value: Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        with self.prevent_overwrite():
+            self._set(name, value)
 
     def write(self, new_contents: Optional[dict] = None,
               overwrite: Optional[bool] = False):
@@ -113,7 +1484,7 @@ class BaseModelFile(ABC):
                                f"\"{self.fname}\"")
         if new_contents is not None:
             self.contents = new_contents
-            del self.is_interactive
+            self._clear_cached_properties()
         self._write(self.fname, self.contents)
         self.generated = True
 
@@ -156,73 +1527,26 @@ class BaseModelFile(ABC):
             ApsimXFile: Copied .apsimx model.
 
         """
-        out = type(self)(self.fname, generated=self.generated)
+        out = type(self)(self.fname, generated=self.generated,
+                         fname_orig=self.fname_orig)
         out.contents = copy.deepcopy(self.contents)
         if kwargs:
             out.move(**kwargs)
         return out
 
-    def make_interactive(self, **kwargs) -> "BaseModelFile":
+    def make_interactive(self, actions: list):
         r"""Modify this file to make it interactive.
 
         Args:
-            **kwargs: Keyword arguments are passed to move.
-
-        Returns:
-            str: Update model path.
+            actions: List of actions that should be enabled.
 
         """
-        kwargs.setdefault("suffix", "-Interactive")
-        self.move(**kwargs)
         if self.is_interactive:
             logger.warn(f"Source model file \"{self.fname}\" is already "
                         f"interactive")
-        else:
-            self._make_interactive()
-            self.generated = False
-        return self.fname
-
-    def set_simulation_times(
-            self,
-            start_time: Optional[datetime.datetime] = None,
-            end_time: Optional[datetime.datetime] = None,
-            sow_date: Optional[datetime.datetime] = None,
-            harvest_date: Optional[datetime.datetime] = None,
-    ):
-        r"""Set the simulation start/end time in the file contents.
-
-        Args:
-            start_time: Simulation start time.
-            end_time: Simulation end time.
-            sow_date: Date that the crop should be sown.
-            harvest_date: Date that the crop should be harvested.
-
-        """
-        if ((start_time is None and end_time is None
-             and sow_date is None and harvest_date is None)):
             return
-        self._set_simulation_times(start_time, end_time,
-                                   sow_date, harvest_date)
-        self.generated = False
-
-    @abstractmethod
-    def _set_simulation_times(
-            self,
-            start_time: Optional[datetime.datetime] = None,
-            end_time: Optional[datetime.datetime] = None,
-            sow_date: Optional[datetime.datetime] = None,
-            harvest_date: Optional[datetime.datetime] = None,
-    ):
-        r"""Set the simulation start/end time in the file contents.
-
-        Args:
-            start_time: Simulation start time.
-            end_time: Simulation end time.
-            sow_date: Date that the crop should be sown.
-            harvest_date: Date that the crop should be harvested.
-
-        """
-        raise NotImplementedError  # pragma: no cover
+        with self.prevent_overwrite(suffix="-Interactive"):
+            self._make_interactive(actions)
 
     @abstractmethod
     def _make_interactive(self):
@@ -240,16 +1564,18 @@ class BaseModelEngine(ABC):
         output_dir: Path to the directory where output should be saved.
         start_time: Simulation start time.
         end_time: Simulation end time.
-        sow_date: Date that the crop should be sown.
-        harvest_date: Date that the crop should be harvested.
+        param: Model parameters to update at the beginning of the
+            simulation.
         actions: Names of actions to include. Only used if action_map
             not provided.
         action_map: Description of actions available via the act method.
+        action_param: Action parameters to use keyed to action names.
 
     """
 
     INPUT_FILE_TYPE = None
     AVAILABLE_ACTION_MAP = {}
+    EXPLICIT_PARAM = ["start_time", "end_time"]
 
     def __init__(
             self,
@@ -258,42 +1584,85 @@ class BaseModelEngine(ABC):
             output_dir: Optional[str] = None,
             start_time: Optional[datetime.datetime] = None,
             end_time: Optional[datetime.datetime] = None,
-            sow_date: Optional[datetime.datetime] = None,
-            harvest_date: Optional[datetime.datetime] = None,
+            param: Optional[dict] = None,
             actions: Optional[List[str]] = None,
-            action_map: Optional[
-                Dict[str, Dict[str, Union[str, float]]]] = None,
+            action_map: Optional[Union[dict, ModelActionSet]] = None,
+            action_param: Optional[dict] = None,
     ):
         self.model_file = model_file
         self.model_suffix = model_suffix
         self.output_dir = output_dir
         self.start_time = start_time
         self.end_time = end_time
-        self.sow_date = sow_date
-        self.harvest_date = harvest_date
-        self.action_map = action_map or self.select_actions(actions)
+        self.initial_param = param.copy() if param is not None else {}
+        self.initial_param_static = {}
+        self.initial_param_dynamic = {}
         self.history = defaultdict(lambda: [])
         self.model = self.INPUT_FILE_TYPE(self.model_file)
-        self.complete_actions(self.action_map)
+        self.action_map = ModelActionSet.create(
+            action_map or self.select_actions(actions),
+        )
+        action_param = (
+            action_param.copy() if action_param is not None else {}
+        )
+        for k in self.EXPLICIT_PARAM:
+            v = getattr(self, k, None)
+            if v is None:
+                continue
+            if k in self.initial_param and self.initial_param[k] != v:
+                logger.warning(
+                    f"Parameter \"{k}\" specified as both an explicit "
+                    f"keyword argument to {type(self)} and in "
+                    f"\"param\". The keyword argument {v} will be used "
+                    f"and the param value {self.initial_param[k]} will "
+                    f"be discarded."
+                )
+            self.initial_param[k] = v
+        for k, v in self.initial_param.items():
+            for action, desc in self.action_map.items():
+                if k not in desc.param_desc or k == desc.action_param:
+                    continue
+                if ((k in action_param.get(action, {})
+                     and action_param[action][k] != v)):
+                    logger.warning(
+                        f"Parameter \"{k}\" specified as both a model "
+                        f"parameter and an action parameter for the "
+                        f"\"{action}\" action. The model parameter {v} "
+                        f"will be used and the action parameter value "
+                        f"{action_param[action][k]} will be discarded"
+                    )
+                action_param.setdefault(action, {})
+                action_param[action][k] = v
+        if action_param:
+            self.action_map.set_param(action_param)
         self.update_model_file()
 
     def update_model_file(self):
         r"""Update the model file to make it interactive and set the
         start/end times."""
         if not self.model.is_interactive:
-            self.model.make_interactive()
+            self.model.make_interactive(list(self.action_map.keys()))
         if self.output_dir or self.model_suffix:
             self.model.move(directory=self.output_dir,
                             suffix=self.model_suffix)
-        if self.start_time or self.end_time:
-            if self.model.exists:
-                self.model.move(suffix="-Modified")
-            self.model.set_simulation_times(
-                start_time=self.start_time,
-                end_time=self.end_time,
-                sow_date=self.sow_date,
-                harvest_date=self.harvest_date,
-            )
+        for k, v in self.initial_param.items():
+            try:
+                self.model.set(k, v)
+                self.initial_param_static[k] = v
+            except KeyError:
+                self.initial_param_dynamic[k] = v
+        added = {}
+        for k in self.EXPLICIT_PARAM:
+            if getattr(self, k, None) is not None:
+                continue
+            try:
+                setattr(self, k, self.model.get(k))
+                added[k] = getattr(self, k)
+            except KeyError:
+                continue
+        if added:
+            logger.info(f"Updated attributes from model file:\n"
+                        f"{pprint.pformat(added)}")
         if not self.model.exists:
             self.model.write()
 
@@ -316,50 +1685,14 @@ class BaseModelEngine(ABC):
             k: cls.AVAILABLE_ACTION_MAP[k].copy() for k in actions
         }
 
-    @classmethod
-    def complete_actions(
-            cls, action_map: dict,
-            num_levels: Optional[int] = 0,
-            allow_donothing: bool = True,
-            exclusive: bool = True,
-    ):
-        r"""Complete an action map filling in missing parameters from
-        AVAILABLE_ACTION_MAP.
+    def get_output_vars(self) -> List[str]:
+        r"""Get the output variables specified by the model file.
 
-        Args:
-            action_map: Descriptions of actions.
-            num_levels: Number of levels per action if not specified in
-                action_map (0 for continuous).
-            allow_donothing: Include non-action as a possible action.
-            exclusive: Don't allow more than one action per step.
+        Returns:
+            list: Output variables
 
         """
-        for action, desc in action_map.items():
-            desc.setdefault("num_levels", num_levels)
-            if action in cls.AVAILABLE_ACTION_MAP:
-                for k, v in cls.AVAILABLE_ACTION_MAP[action].items():
-                    desc.setdefault(k, v)
-            if desc["num_levels"] == 1 and "max" not in desc:
-                # Boolean
-                continue
-            if "max" not in desc:
-                raise InvalidActionError(
-                    f"Error parsing description of action \"{action}\". "
-                    f"num_levels = 1 and a \"max\" parameter is not "
-                    f"provided, indicating a non-boolean action. "
-                    f"Non-boolean actions must have a maximum value."
-                )
-            if desc["num_levels"] == 0:
-                desc.setdefault("min", 0.0)
-            elif "levels" not in desc:
-                if allow_donothing and not exclusive:
-                    desc.setdefault("min", 0.0)
-                else:
-                    desc.setdefault(
-                        "min", desc["max"] / desc["num_levels"])
-                desc["levels"] = np.linspace(
-                    desc["min"], desc["max"], desc["num_levels"]
-                ).tolist()
+        return self.model.output_vars
 
     @property
     def is_complete(self):
@@ -386,13 +1719,34 @@ class BaseModelEngine(ABC):
         r"""datetime.datetime: Current simulation time."""
         raise NotImplementedError  # pragma: no cover
 
-    @abstractmethod
     def start(self):
+        r"""Start the model engine."""
+        self._start()
+        self.setvars(self.initial_param_dynamic)
+        logger.info(f"Simulating from {self.start_time} to {self.end_time}")
+        added = {}
+        for k in self.EXPLICIT_PARAM:
+            v = getattr(self, k, None)
+            if v is not None:
+                continue
+            setattr(self, k, self.get(k, allow_error=True))
+            if getattr(self, k) is not None:
+                added[k] = getattr(self, k)
+        if added:
+            logger.info(f"Updated attributes from running model:\n"
+                        f"{pprint.pformat(added)}")
+
+    @abstractmethod
+    def _start(self):
         r"""Start the model engine."""
         raise NotImplementedError  # pragma: no cover
 
-    @abstractmethod
     def stop(self):
+        r"""Stop the model engine."""
+        self._stop()
+
+    @abstractmethod
+    def _stop(self):
         r"""Stop the model engine."""
         raise NotImplementedError  # pragma: no cover
 
@@ -522,25 +1876,10 @@ class BaseModelEngine(ABC):
                     f"Unsupported action \"{action}\". Supported "
                     f"actions include: {list(self.action_map.keys())}")
                 # return self.set(action, *args)
-            param = self.action_map.get(action, {}).get("param", [])
-            if len(args) > len(param):
-                raise InvalidActionError(
-                    f"Tool many ({len(args)}) parameters provided for "
-                    f"action ({action}). Valid parameters: {param}")
             kws = {}
-            for k, v in kwargs.items():
-                if k not in param:
-                    raise InvalidActionError(
-                        f"Invalid parameter \"{k}\" provided for action "
-                        f"\"{action}\". Valid parameters: {param}")
-                kws[k] = v
-            for k, v in zip(param, args):
-                if k in kws:
-                    raise InvalidActionError(
-                        f"\"{k}\" parameter for action \"{action}\" "
-                        f"provided as both a positional and keyword "
-                        f"argument")
-                kws[k] = v
+            if action in self.action_map:
+                kws = self.action_map[action].combine_args_and_kwargs(
+                    args, kwargs)
             out = self._act(action, kws)
         logger.debug(f"act: {action}[{args}, {kwargs}]")
         if action == "terminate":
@@ -617,8 +1956,6 @@ class BaseModelEngine(ABC):
         elif isinstance(time, datetime.timedelta):
             time = min(self.current_time + time, self.end_time)
         if time <= self.current_time:
-            # if self.current_time == self.end_time:
-            #     self.resume()  # Ensure that the simulation finishes
             return
         if time > self.end_time:
             logger.warning(f"Cannot fast-forward to {time} from "
@@ -630,7 +1967,7 @@ class BaseModelEngine(ABC):
             #     self.resume()
             return
         logger.info(f"Fast-forward to {time} from {self.current_time}")
-        while ((self.is_running and self.current_time <= time
+        while ((self.is_running and self.current_time < time
                 and not self.is_complete)):
             self.resume(wait=True)
 
@@ -656,14 +1993,15 @@ class BaseModelEngine(ABC):
         logger.info(f"Rewinding to {time} from {self.current_time}")
         history = self.history
         self.reset()
-        for t, actions in history.items():
-            if t > time:
-                break
-            self.fast_forward(t)
-            for action in actions:
-                logger.info(f"Replaying t={t}: {action}")
-                getattr(self, action[0])(
-                    action[1], *action[2], **action[3])
+        if self.current_time < time:
+            for t, actions in history.items():
+                if t > time:
+                    break
+                self.fast_forward(t)
+                for action in actions:
+                    logger.info(f"Replaying t={t}: {action}")
+                    getattr(self, action[0])(
+                        action[1], *action[2], **action[3])
         if time > self.current_time:
             self.fast_forward(time)
 
@@ -678,6 +2016,321 @@ class BaseModelEngine(ABC):
         raise NotImplementedError  # pragma: no cover
 
 
+class BaseModelLLMPromptGenerator(CachedPropertyMixin, ABC):
+    """Generate LLM prompts for environments.
+
+    This class handles the creation of system prompts and turn prompts
+    for LLM-based agricultural management agents.
+    """
+
+    VALID_THINKING_MODES = {"minimal", "grounding_decision"}
+    THINKING_MODE_ALIASES = {
+        "think": "grounding_decision",
+    }
+    DEFAULT_REWARD = ""
+    DEFAULT_STATE_DESCRIPTOR = ""
+    DEFAULT_DESC_MAP = {}
+
+    def __init__(
+            self,
+            num_levels: Optional[int] = 4,
+            intervention_interval: Optional[int] = 7,
+            output_vars: Optional[List[str]] = None,
+            desc_map: Optional[Dict[str, Tuple[str, str]]] = None,
+            action_map: Optional[Union[dict, ModelActionSet]] = None,
+            reward: Optional[str] = None,
+            state_descriptor: Optional[str] = None,
+            allow_donothing: Optional[bool] = True,
+            exclusive: Optional[bool] = True,
+            require_think: bool = False,
+            thinking_mode: str = "grounding_decision",
+            think_tag: str = "think",
+            answer_tag: str = "answer",
+    ):
+        """Initialize the prompt generator.
+
+        Args:
+            num_levels: Number of levels per action if not specified in
+                action_map (0 for continuous).
+            intervention_interval: Days between decisions
+            output_vars: List of observation variable names
+            desc_map: Custom description mapping for variables
+            action_map: Custom description mapping for actions
+            reward: Description of the reward that should be used.
+            state_descriptor: Description of the overall type of state
+                information.
+            allow_donothing: Include non-action as a possible action.
+            exclusive: Don't allow more than one action per step.
+            require_think: Whether to require thinking before answering
+            thinking_mode: Thinking prompt variant when require_think=True.
+                Supported values: "minimal", "think" (alias of
+                "grounding_decision"), "grounding_decision"
+            think_tag: Tag name for thinking (default: "think", e.g.
+                "tool_call")
+            answer_tag: Tag name for answer (default: "answer")
+
+        """
+        self.num_levels = num_levels
+        self.intervention_interval = intervention_interval
+        self.output_vars = output_vars or []
+        self.desc_map = desc_map or self.DEFAULT_DESC_MAP
+        self.reward = reward or self.DEFAULT_REWARD
+        self.state_descriptor = (
+            state_descriptor or self.DEFAULT_STATE_DESCRIPTOR)
+        if self.state_descriptor:
+            self.state_descriptor = self.state_descriptor.strip() + " "
+        self.allow_donothing = allow_donothing
+        self.exclusive = exclusive
+        self.require_think = require_think
+        self.thinking_mode = self._normalize_thinking_mode(thinking_mode)
+        self.think_tag = think_tag
+        self.answer_tag = answer_tag
+        self.action_map = ModelActionSet.create(
+            action_map or {},
+            num_levels=self.num_levels,
+            allow_donothing=self.allow_donothing,
+            exclusive=self.exclusive,
+        )
+        super().__init__()
+
+    @readonly_cached_property
+    def reward_inline(self) -> str:
+        r"""str: Version of the reward for inclusion in statements."""
+        return self.reward.lower().strip(".")
+
+    @readonly_cached_property
+    def state_grounding(self) -> str:
+        r"""str: State grounding description."""
+        return (
+            f"State grounding: describe the current "
+            f"{self.state_descriptor}state, the main limiting "
+            f"factor and any missing information based on the "
+            f"current observations"
+        )
+
+    @abstractmethod
+    def turn_context(self, observation: np.ndarray) -> str:
+        r"""Generate a string to summarize the current turn at a high
+        level with the context of the simulation.
+
+        Args:
+            observation: Current state.
+
+        Returns:
+            str: Turn summary.
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
+    @classmethod
+    def _normalize_thinking_mode(cls, thinking_mode: str) -> str:
+        """Normalize and validate the thinking mode name."""
+        normalized = str(thinking_mode).strip().lower().replace("-", "_")
+        normalized = cls.THINKING_MODE_ALIASES.get(normalized, normalized)
+        if normalized not in cls.VALID_THINKING_MODES:
+            valid = ", ".join(
+                sorted(cls.VALID_THINKING_MODES
+                       | set(cls.THINKING_MODE_ALIASES)))
+            raise ValueError(
+                f"Invalid thinking_mode '{thinking_mode}'. Expected one "
+                f"of: {valid}")
+        return normalized
+
+    @abstractmethod
+    def get_system_prompt(self) -> str:
+        """Generate the system prompt for the LLM agent.
+
+        Returns:
+            System prompt string
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
+    def get_turn_prompt(self, observation: np.ndarray) -> str:
+        """Generate the complete per-turn user prompt.
+
+        Supports plain-answer mode plus two thinking guidance variants.
+        Structure: intro → observation → actions → guidance → format.
+
+        """
+        output_vars = self.output_vars
+        if not output_vars:
+            raise ValueError("output_vars must be provided in __init__")
+
+        # ── 1. Intro ────────────────────────────────────────────────
+        intro = self.turn_context(observation)
+
+        bridge = (
+            "Below is the current observation for this step."
+        )
+
+        # ── 2. Observation block ────────────────────────────────────
+        obs_sections = {}
+        for key, value in zip(output_vars, observation):
+            section, desc = self.desc_map.get(key, ("Other", key))
+            if section == "Timeline":
+                continue
+            obs_sections.setdefault(section, [])
+            obs_sections[section].append(f"- {desc}: {value:.4g}")
+        obs_lines = []
+        for section, section_lines in obs_sections.items():
+            obs_lines.append(f"[{section}]")
+            obs_lines += section_lines
+
+        # ── 3. Action options ───────────────────────────────────────
+        action_lines = self.action_map.description_lines.copy()
+        example_action = self.action_map.example_description
+
+        # ── 4. Decision guidance (varies by require_think × thinking_mode)
+        if not self.require_think:
+            guidance_intro = (
+                "Please consider the following when making a decision:"
+            )
+            action_lines.extend([
+                "",
+                guidance_intro,
+                f"1. {self.state_grounding}",
+                f"2. Decision: determine which available action is most "
+                f"likely to {self.reward_inline} at this step",
+            ])
+        elif self.thinking_mode == "grounding_decision":
+            action_lines.extend([
+                "",
+                "Please reason briefly before action about:",
+                f"1. {self.state_grounding}",
+                f"2. Decision: determine which available action is most "
+                f"likely to {self.reward_inline} at this step",
+            ])
+        else:
+            action_lines.extend([
+                "",
+                "Please think about your choice before answering.",
+            ])
+
+        # ── 5. Response format (varies by require_think) ───────────
+        at = self.answer_tag
+        if self.require_think:
+            tt = self.think_tag
+            if self.thinking_mode == "grounding_decision":
+                action_lines.extend([
+                    "",
+                    "Keep the reasoning concise and decision-focused. "
+                    "Do not restate the full input.",
+                    "",
+                    f"Respond using the exact format: <{tt}> ... </{tt}> "
+                    f"<{at}> ... </{at}> with no extra text.",
+                    "",
+                    f"Example: <{tt}>[reasoning content]</{tt}> "
+                    f"<{at}>{example_action}</{at}>",
+                ])
+            else:
+                action_lines.extend([
+                    "",
+                    f"Respond using the exact format: <{tt}> ... </{tt}> "
+                    f"<{at}> ... </{at}> with no extra text.",
+                    "",
+                    f"Example: <{tt}>[reasoning content]</{tt}> "
+                    f"<{at}>{example_action}</{at}>",
+                ])
+        else:
+            action_lines.extend([
+                "",
+                f"Respond using the exact format: <{at}> ... </{at}> "
+                f"with no extra text.",
+                "",
+                f"Example: <{at}>{example_action}</{at}>",
+            ])
+
+        # ── Assemble (sections joined by blank lines) ───────────────
+        sections = [intro, bridge]
+        sections.append(
+            f"<current observation>\n{chr(10).join(obs_lines)}\n"
+            f"</current observation>"
+        )
+        sections.append("\n".join(action_lines))
+        return "\n\n".join(sections)
+
+    def describe_action(self, action_id: Union[int, dict, tuple]) -> str:
+        """Convert action ID to natural language description.
+
+        Args:
+            action_id: Integer action ID from the environment
+
+        Returns:
+            Natural language description in <answer>...</answer> format
+
+        """
+        at = self.answer_tag
+        try:
+            action = self.action_map.action2description(action_id)
+            return f"<{at}>{action}</{at}>"
+        except BaseException:
+            return f"<{at}>Unknown action {action_id}.</{at}>"
+
+    def parse_action_response(
+            self, response: str) -> Optional[Union[int, dict, tuple]]:
+        """Parse LLM response to extract action ID.
+
+        Both modes use strict fullmatch — any extra content is invalid.
+        Model-inherent thinking is extracted by the model interface layer
+        before the response reaches this method.
+
+        - ``require_think=True``:  ``<tag>...</tag><answer>...</answer>``
+        - ``require_think=False``: ``<answer>...</answer>`` only
+
+        """
+        at = re.escape(self.answer_tag)
+        if self.require_think:
+            tt = re.escape(self.think_tag)
+            m = re.fullmatch(
+                rf"\s*<{tt}>(.*?)</{tt}>\s*<{at}>(.*?)</{at}>\s*",
+                response,
+                re.DOTALL,
+            )
+        else:
+            m = re.fullmatch(
+                rf"\s*<{at}>(.*?)</{at}>\s*",
+                response,
+                re.DOTALL,
+            )
+        if m is None:
+            return None
+        action_text = m.group(m.lastindex).strip()
+        try:
+            return self.action_map.description2action(action_text)
+        except InvalidActionError:
+            return None
+
+    @classmethod
+    def from_env(
+            cls,
+            env: "BaseModelEnv",
+            **kwargs
+    ) -> "BaseModelLLMPromptGenerator":
+        """Create prompt generator from a model gym environment.
+
+        Args:
+            env: model gym environment instance
+            **kwargs: Additional keyword arguments are passed to the
+                class constructor.
+
+        Returns:
+            BaseModelLLMPromptGenerator instance configured for the
+                environment.
+
+        """
+        return cls(
+            num_levels=env.num_levels,
+            intervention_interval=env.intervention_interval,
+            output_vars=env.output_vars,
+            action_map=env.action_map,
+            allow_donothing=env.allow_donothing,
+            exclusive=env.exclusive,
+            # REWARD
+            **kwargs
+        )
+
+
 class BaseModelEnv(gym.Env, metaclass=ABCMeta):
     r"""ApsimX environment.
 
@@ -689,13 +2342,15 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             provided, the units will be assumed to be days.
         output_vars: List of observation variable names.
         num_levels: Number of levels per action if not specified in
-            action_map (0 for continuous).
+            action_map (0 for continuous, -1 for boolean).
         actions: Names of actions to include. Only used if action_map
             not provided.
         action_map: Custom description mapping for actions.
         revenue_var: Description of how profit should be calculated from
             an output variable.
-        param: Additional parameters to set when the simulation begins.
+        model_param: Initial model parameters to set in the model file
+            and/or when the simulation begins.
+        action_param: Action parameters to use keyed to action names.
         allow_donothing: Include non-action as a possible action.
         exclusive: Don't allow more than one action per step.
         **kwargs: Additional keyword arguments are passed to the model
@@ -704,24 +2359,27 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
     """
 
     MODEL_ENGINE_CLASS = None
+    LLM_PROMPT_GENERATOR_CLASS = None
     DEFAULT_ACTIONS = []
     DEFAULT_REVENUE_VAR = {}
 
     def __init__(
             self,
             model_file: str,
-            start_time: datetime.datetime = None,
-            end_time: datetime.datetime = None,
-            intervention_interval: Union[int, datetime.timedelta] = 7,
+            start_time: Optional[datetime.datetime] = None,
+            end_time: Optional[datetime.datetime] = None,
+            intervention_interval: Optional[
+                Union[int, datetime.timedelta]] = 7,
             output_vars: Optional[List[str]] = None,
-            num_levels: int = 4,
+            num_levels: Optional[int] = 4,
             actions: Optional[List[str]] = None,
-            action_map: Optional[
-                Dict[str, Dict[str, Union[str, float]]]] = None,
+            action_map: Optional[Union[dict, ModelActionSet]] = None,
             revenue_var: Optional[Dict[str, Union[str, float]]] = None,
-            param: Optional[dict] = None,
-            allow_donothing: bool = True,
-            exclusive: bool = True,
+            model_param: Optional[dict] = None,
+            action_param: Optional[dict] = None,
+            allow_donothing: Optional[bool] = True,
+            exclusive: Optional[bool] = True,
+            scale_action_amounts_by_interval: Optional[bool] = False,
             **kwargs
     ):
         self.model_file = model_file
@@ -734,76 +2392,51 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         )
         self.output_vars = output_vars or []
         self.num_levels = num_levels
-        self.action_map = (
-            action_map or self.MODEL_ENGINE_CLASS.select_actions(
-                actions or self.DEFAULT_ACTIONS)
-        )
         self.revenue_var = revenue_var or copy.deepcopy(
             self.DEFAULT_REVENUE_VAR)
+        self.model_param = model_param
+        self.allow_donothing = allow_donothing
+        self.exclusive = exclusive
+        self.model_kwargs = kwargs
+        self.action_map = ModelActionSet.create(
+            (action_map or self.MODEL_ENGINE_CLASS.select_actions(
+                actions or self.DEFAULT_ACTIONS)),
+            num_levels=self.num_levels,
+            allow_donothing=self.allow_donothing,
+            exclusive=self.exclusive,
+            default_action_map=self.MODEL_ENGINE_CLASS.AVAILABLE_ACTION_MAP,
+        )
+        if action_param:
+            self.action_map.set_param(action_param)
+        if scale_action_amounts_by_interval:
+            self.action_map.scale_action_amounts(
+                float(self.intervention_interval.days)
+            )
+
+        self.model = self.create_model(**self.model_kwargs)
+        self.model.start()
+        if self.start_time is None:
+            self.start_time = self.model.start_time
+        if self.end_time is None:
+            self.end_time = self.model.end_time
+        if not self.output_vars:
+            self.output_vars = self.model.get_output_vars()
         if self.revenue_var:
             self.output_vars = [self.revenue_var["name"]] + [
                 k for k in self.output_vars
                 if k != self.revenue_var["name"]
             ]
-        self.param = param
-        self.allow_donothing = allow_donothing
-        self.exclusive = exclusive
-        self.model_kwargs = kwargs
-        self.MODEL_ENGINE_CLASS.complete_actions(
-            self.action_map, num_levels=self.num_levels,
-            allow_donothing=self.allow_donothing,
-            exclusive=self.exclusive,
-        )
 
         # Define what actions are available (bounds for each parameter)
-        self.action_order = []
-        if self.exclusive:
-            if all("levels" in desc for desc in
-                   self.action_map.values()):
-                if self.allow_donothing:
-                    self.action_order.append({})
-                for action, desc in self.action_map.items():
-                    self.action_order += [
-                        {action: value} for value in desc["levels"]
-                    ]
-                self.action_space = gym.spaces.Discrete(
-                    int(self.allow_donothing)
-                    + sum(len(desc["levels"]) for desc in
-                          self.action_map.values())
-                )
-            else:
-                if self.allow_donothing:
-                    self.action_order.append(None)
-                self.action_order += list(self.action_map.keys())
-                self.action_space = gym.spaces.OneOf([
-                    self._create_action_space(
-                        self.action_map.get(action, {}))
-                    for action in self.action_order
-                ])
-        else:
-            self.action_space = gym.spaces.Dict(
-                {
-                    action: self._create_action_space(desc)
-                    for action, desc in self.action_map.items()
-                }
-            )
-            self.action_order = list(self.action_map.keys())
+        self.action_space = self.action_map.space
 
         # Define what the agent can observe (bounds for each output)
         self.observation_space = gym.spaces.Box(
-            shape=(1 + len(self.output_vars), ),
+            shape=(len(self.output_vars, ), ),
             low=-np.inf, high=np.inf,
             dtype=np.float64,
         )
 
-        self.model = self.create_model(**self.model_kwargs)
-        self.model.start()
-        if self.param:
-            self.model.setvars(self.param)
-        if self.start_time is None:
-            self.start_time = self.model.start_time
-        if self.end_time is None:
-            self.end_time = self.model.end_time
         self.log = self._init_log()
 
     @property
@@ -812,47 +2445,11 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         return self.model.current_time
 
     @property
-    def field_area(self):
-        r"""float: Field area."""
-        return 1.0  # Report in terms of $/ha
-
-    @property
     def intervention_timedelta(self):
         r"""datetime.timedelta: Intervention interval as delta."""
         if isinstance(self.intervention_interval, datetime.timedelta):
             return self.intervention_interval
         return datetime.timedelta(self.intervention_interval)
-
-    @classmethod
-    def _create_action_space(cls, desc):
-        if not desc:
-            return gym.spaces.Discrete(1)
-        if "levels" in desc:
-            return gym.spaces.Discrete(len(desc["levels"]))
-        return gym.spaces.Box(shape=(1,), dtype=np.float64,
-                              low=desc["min"], high=desc["max"])
-
-    def _wrap_action(self, action):
-        if isinstance(self.action_space, gym.spaces.Discrete):
-            return self.action_order[action]
-        elif isinstance(self.action_space, gym.spaces.OneOf):
-            space = self.action_order[action[0]]
-            if space is None:
-                return {}
-            if "levels" in self.action_map[space]:
-                value = self.action_map[space][action[1]]
-            else:
-                value = action[1]
-            return {space: value}
-        out = {}
-        if not isinstance(action, dict):
-            action = {k: v for k, v in zip(self.action_order, action)}
-        for k, v in action.items():
-            if "levels" in self.action_map[k]:
-                out[k] = self.action_map[k]["levels"][v]
-            else:
-                out[k] = v
-        return out
 
     def _init_log(self) -> dict:
         r"""Initialize the log."""
@@ -861,7 +2458,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             "obs": dict(),
             "cost": dict(),
             "reward": dict(),
-            "day": dict(),
+            "time": dict(),
         }
 
     def _log(self, action: dict, obs: dict, reward: float) -> None:
@@ -877,7 +2474,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         self.log["obs"][self.current_time] = obs
         self.log["cost"][self.current_time] = self._get_cost(action)
         self.log["reward"][self.current_time] = reward
-        self.log["day"][self.current_time] = self.current_time
+        self.log["time"][self.current_time] = self.current_time
 
     def create_model(self, **kwargs) -> BaseModelEngine:
         r"""Create a new model engine."""
@@ -886,6 +2483,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             start_time=self.start_time,
             end_time=self.end_time,
             action_map=self.action_map,
+            param=self.model_param,
             **kwargs
         )
 
@@ -893,6 +2491,20 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         r"""Close the environment."""
         self.model.stop()
         super().close()
+
+    def get_llm_prompt_generator(
+            self, **kwargs) -> "BaseModelLLMPromptGenerator":
+        r"""Create an LLM prompt generator for this environment.
+
+        Args:
+            **kwargs: Keyword arguments are passed to the from_env
+                method of the LLM_PROMPT_GENERATOR_CLASS type.
+
+        Returns:
+            BaseModelLLMPromptGenerator: LLM prompt generator.
+
+        """
+        return self.LLM_PROMPT_GENERATOR_CLASS.from_env(self)
 
     def _get_cost(self, action: dict) -> float:
         r"""Calculate the cost of the current action.
@@ -906,11 +2518,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         """
         out = 0.0
         for k, v in action.items():
-            if self.action_map[k].get("cost", 0) > 0:
-                out += (
-                    self.action_map["cost"] * v
-                    * self.model.field_area
-                )
+            out += self.action_map[k].args2cost(v)
         return out
 
     def _get_revenue(self, obs: dict) -> float:
@@ -927,8 +2535,8 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             raise NotImplementedError(
                 "Provide revenue_var or override the _get_reward method")
         return (
-            obs[self.reveue_var["name"]] * self.reveue_var.get("cost", 1)
-            * self.model.field_area
+            obs[self.revenue_var["name"]]
+            * self.revenue_var.get("cost", 1)
         )
 
     def _get_reward(self, action: dict, observation) -> float:
@@ -952,12 +2560,12 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         r"""Observe the current state of the model.
 
         Returns:
-            np.ndarray: Array of state parameters.
+            dict: Output state properties.
 
         """
         return self.model.getvars(self.output_vars)
 
-    def _process_observation(self, observation: dict):
+    def _process_observation(self, observation: dict) -> np.ndarray:
         r"""Force the observations into the expected format.
 
         Args:
@@ -967,11 +2575,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             np.ndarray: Array of observations parameters.
 
         """
-        days_elapsed = self.model.current_time - self.model.start_time
-        observation = np.concatenate([
-            np.array(list(observation.values())),
-            [days_elapsed.days],
-        ])
+        observation = np.array(list(observation.values()))
         for i in range(len(observation)):
             if isinstance(observation[i], datetime.date):
                 observation[i] = int(observation[i].strftime("%Y%m%d"))
@@ -1009,13 +2613,13 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             tuple: (observation, reward, terminated, truncated, info)
 
         """
-        action_dict = self._wrap_action(action)
+        action_dict = self.action_map.action2args(action)
         self.model.actvars(action_dict)
         self.model.fast_forward(self.intervention_timedelta)
         observation = self._get_obs()
         reward = self._get_reward(action_dict, observation)
         terminated = (not self.model.is_running)
         truncated = self.model.is_complete
-        self._log(action, observation, reward)
+        self._log(action_dict, observation, reward)
         return (self._process_observation(observation), reward,
                 terminated, truncated, self.log)
