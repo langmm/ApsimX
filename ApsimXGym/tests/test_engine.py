@@ -17,10 +17,11 @@ class TestApsimXEngine:
     @pytest.fixture(scope="class")
     def default_instance_kwargs(self, apsimx_dir):
         return {
+            "crop_name": "Wheat",
             "actions": ["nitrogen", "irrigate"],
-            "apsimx_dir": apsimx_dir,
-            "start_time": datetime.datetime(year=1900, month=1, day=1),
-            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "model_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1981, month=1, day=1),
+            "end_time": datetime.datetime(year=1981, month=11, day=5),
         }
 
     @pytest.fixture(scope="class")
@@ -28,11 +29,12 @@ class TestApsimXEngine:
 
         @contextlib.contextmanager
         def _new_instance(model_file=None, **kwargs):
-            if model_file is None:
-                model_file = example_model
+            if (("model_file" not in kwargs
+                 and "crop_name" not in kwargs)):
+                kwargs["model_file"] = example_model
             for k, v in default_instance_kwargs.items():
                 kwargs.setdefault(k, v)
-            instance = ApsimXEngine(model_file, **kwargs)
+            instance = ApsimXEngine(**kwargs)
             instance.start()
             try:
                 yield instance
@@ -68,7 +70,7 @@ class TestApsimXEngine:
             )),
             ("set", RecoverableModelEngineError, (
                 "[Clock].Start",
-                datetime.datetime(year=1900, month=1, day=1).timestamp()
+                datetime.datetime(year=1981, month=1, day=1).timestamp()
             )),
             ("act", RecoverableModelEngineError, (
                 "nitrogen", "hello",
@@ -100,8 +102,21 @@ class TestApsimXEngine:
 
     def test_loop(self, new_instance):
         r"""Test loop to apply fertilizer and irrigate."""
-        with new_instance() as instance:
+        with new_instance(
+                latitude=40.1164, longitude=-88.2434,
+        ) as instance:
             i = 0
+            orig_value = 0.05
+            new_value = 0.043
+            reply = instance.get(
+                "[Grain].MaximumPotentialGrainSize.FixedValue")
+            assert reply == orig_value
+            instance.set(
+                "[Grain].MaximumPotentialGrainSize.FixedValue",
+                new_value)
+            reply = instance.get(
+                "[Grain].MaximumPotentialGrainSize.FixedValue")
+            assert reply == new_value
             while instance.is_running and not instance.is_complete:
                 instance.getvars([
                     "[Wheat].Phenology.Zadok.Stage",
@@ -130,45 +145,43 @@ class TestApsimXEngine:
                 instance.fast_forward(datetime.timedelta(days=10))
                 i += 1
 
-    def test_scrub(self, new_instance):
+    def test_scrub(self, instance):
         r"""Test rewind/fast-forward."""
-        # TODO: Use existing instance
-        start_time = datetime.datetime(year=1900, month=1, day=1)
-        end_time = datetime.datetime(year=1900, month=11, day=5)
-        with new_instance(
-                start_time=start_time, end_time=end_time
-        ) as instance:
-            time = datetime.datetime(year=1900, month=5, day=23)
-            # Run complete simulation without fertilizing
-            assert instance.current_time == start_time
-            instance.fast_forward()
-            assert instance.current_time == end_time
-            assert instance.is_running
-            value_none = instance.get("[Wheat].Grain.Total.Wt")
-            # print("NONE", instance.current_time, value_none)
-            # Rewind and run again with full
-            instance.rewind()
-            instance.rewind(datetime.timedelta(days=20))
-            assert instance.current_time == start_time
-            while instance.is_running and not instance.is_complete:
-                instance.act("nitrogen", 0.001)
-                instance.fast_forward(datetime.timedelta(days=20))
-            assert instance.current_time == end_time
-            value_full = instance.get("[Wheat].Grain.Total.Wt")
-            # print("FULL", instance.current_time, value_full)
-            # Rewind halfway and run without from there
-            instance.rewind(time)
-            assert instance.current_time == time
-            instance.fast_forward()
-            assert instance.current_time == end_time
+        start_time = instance.start_time
+        end_time = instance.end_time
+        # start_time = datetime.datetime(year=1981, month=1, day=1)
+        # end_time = datetime.datetime(year=1981, month=11, day=5)
+        time = datetime.datetime(year=1981, month=5, day=23)
+        # Run complete simulation without fertilizing
+        assert instance.current_time == start_time
+        instance.fast_forward()
+        assert instance.current_time == end_time
+        assert instance.is_running
+        value_none = instance.get("[Wheat].Grain.Total.Wt")
+        # print("NONE", instance.current_time, value_none)
+        # Rewind and run again with full
+        instance.rewind()
+        instance.rewind(datetime.timedelta(days=20))
+        assert instance.current_time == start_time
+        while instance.is_running and not instance.is_complete:
+            instance.act("nitrogen", 0.001)
             instance.fast_forward(datetime.timedelta(days=20))
-            value_half = instance.get("[Wheat].Grain.Total.Wt")
-            # print("HALF", instance.current_time, value_half)
-            # Compare
-            assert value_half > value_none
-            assert value_full > value_half
-            instance.rewind()
-            assert instance.current_time == start_time
+        assert instance.current_time == end_time
+        value_full = instance.get("[Wheat].Grain.Total.Wt")
+        # print("FULL", instance.current_time, value_full)
+        # Rewind halfway and run without from there
+        instance.rewind(time)
+        assert instance.current_time == time
+        instance.fast_forward()
+        assert instance.current_time == end_time
+        instance.fast_forward(datetime.timedelta(days=20))
+        value_half = instance.get("[Wheat].Grain.Total.Wt")
+        # print("HALF", instance.current_time, value_half)
+        # Compare
+        assert value_half > value_none
+        assert value_full > value_half
+        instance.rewind()
+        assert instance.current_time == start_time
 
     def test_action_param(self, new_instance):
         r"""Test actions with parameters."""
@@ -184,7 +197,7 @@ class TestApsimXEngine:
             instance.act("nitrogen", 160.0, type="UreaN")
             instance.act("sow", sowingDepth=10.0)
             instance.fast_forward(
-                datetime.datetime(year=1900, month=5, day=23))
+                datetime.datetime(year=1981, month=5, day=23))
             instance.act("harvest")
 
 
@@ -194,9 +207,9 @@ class TestApsimXEnv:
     @pytest.fixture(scope="class")
     def default_instance_kwargs(self, apsimx_dir):
         return {
-            "apsimx_dir": apsimx_dir,
-            "start_time": datetime.datetime(year=1900, month=1, day=1),
-            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "model_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1981, month=1, day=1),
+            "end_time": datetime.datetime(year=1981, month=12, day=31),
         }
 
     @pytest.fixture(scope="class")
@@ -204,11 +217,12 @@ class TestApsimXEnv:
 
         @contextlib.contextmanager
         def _new_instance(model_file=None, **kwargs):
-            if model_file is None:
-                model_file = example_model
+            if (("model_file" not in kwargs
+                 and "crop_name" not in kwargs)):
+                kwargs["model_file"] = example_model
             for k, v in default_instance_kwargs.items():
                 kwargs.setdefault(k, v)
-            env = ApsimXEnv(model_file, **kwargs)
+            env = ApsimXEnv(**kwargs)
             try:
                 yield env
             finally:
@@ -289,9 +303,9 @@ class TestApsimXEnvContinuous(TestApsimXEnv):
     @pytest.fixture(scope="class")
     def default_instance_kwargs(self, apsimx_dir):
         return {
-            "apsimx_dir": apsimx_dir,
-            "start_time": datetime.datetime(year=1900, month=1, day=1),
-            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "model_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1981, month=1, day=1),
+            "end_time": datetime.datetime(year=1981, month=12, day=31),
             "num_levels": 0,
         }
 
@@ -321,9 +335,9 @@ class TestApsimXEnvSimultaneous(TestApsimXEnv):
     @pytest.fixture(scope="class")
     def default_instance_kwargs(self, apsimx_dir):
         return {
-            "apsimx_dir": apsimx_dir,
-            "start_time": datetime.datetime(year=1900, month=1, day=1),
-            "end_time": datetime.datetime(year=1900, month=12, day=31),
+            "model_dir": apsimx_dir,
+            "start_time": datetime.datetime(year=1981, month=1, day=1),
+            "end_time": datetime.datetime(year=1981, month=12, day=31),
             "exclusive": False,
             "num_levels": 0,
         }

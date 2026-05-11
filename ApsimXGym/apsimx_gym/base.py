@@ -1,6 +1,7 @@
 import os
 import re
 import copy
+import uuid
 import pprint
 import datetime
 import contextlib
@@ -479,9 +480,11 @@ class ModelAction(CachedPropertyMixin):
 
         """
         desc = description.lower()
-        if self.numeric and (self.name.lower() in desc
-                             or any(k.lower() in desc
-                                    for k in self.keywords)):
+        if (((self.numeric or self.boolean)
+             and (self.name.lower() in desc
+                  or any(k.lower() in desc for k in self.keywords)))):
+            if self.boolean:
+                return True
             amount_match = re.search(r"(\d+\.?\d*)", description)
             if amount_match:
                 return self.dtype(amount_match.group(1))
@@ -1507,14 +1510,21 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
         """
         assert self.contents
-        if dst is None and suffix:
-            dst = suffix.join(os.path.splitext(self.fname))
+        if dst is None:
+            if suffix:
+                dst = suffix.join(os.path.splitext(self.fname))
+            else:
+                dst = self.fname
         if directory is not None:
             dst = os.path.join(directory, os.path.basename(dst))
+        while os.path.isfile(dst):
+            dst = str(uuid.uuid4()).join(os.path.splitext(dst))
         if dst != self.fname:
             self.generated = False
         self.fname = dst
-        assert not self.exists
+        if self.exists:
+            raise ValueError(f"Cannot move to a file that already exists: "
+                             f"\"{self.fname}\"")
         return self.fname
 
     def copy(self, **kwargs) -> "BaseModelFile":
@@ -1559,6 +1569,7 @@ class BaseModelEngine(ABC):
 
     Args:
         model_file: Path to one or more model input files.
+        model_dir: Path to the directory containing the model.
         model_suffix: Additional suffix to add to a copy of the provided
             model file to ensure that it is unique.
         output_dir: Path to the directory where output should be saved.
@@ -1580,6 +1591,7 @@ class BaseModelEngine(ABC):
     def __init__(
             self,
             model_file: Union[str, List[str]],
+            model_dir: Optional[str] = None,
             model_suffix: Optional[str] = None,
             output_dir: Optional[str] = None,
             start_time: Optional[datetime.datetime] = None,
@@ -1590,6 +1602,7 @@ class BaseModelEngine(ABC):
             action_param: Optional[dict] = None,
     ):
         self.model_file = model_file
+        self.model_dir = model_dir
         self.model_suffix = model_suffix
         self.output_dir = output_dir
         self.start_time = start_time
@@ -1598,6 +1611,13 @@ class BaseModelEngine(ABC):
         self.initial_param_static = {}
         self.initial_param_dynamic = {}
         self.history = defaultdict(lambda: [])
+        if ((self.model_file and self.model_dir
+             and (not os.path.isfile(self.model_file))
+             and (not os.path.isabs(self.model_file))
+             and os.path.isfile(
+                 os.path.join(self.model_dir, self.model_file)))):
+            self.model_file = os.path.join(
+                self.model_dir, self.model_file)
         self.model = self.INPUT_FILE_TYPE(self.model_file)
         self.action_map = ModelActionSet.create(
             action_map or self.select_actions(actions),
@@ -1668,21 +1688,23 @@ class BaseModelEngine(ABC):
 
     @classmethod
     def select_actions(cls, actions: Optional[List[str]] = None,
-                       num_levels: Optional[int] = None):
+                       action_map: Optional[dict] = None):
         r"""Select a set of default actions.
 
         Args:
             actions: Set of actions to select.
-            num_levels: Number of levels per action if not specified in
-            action_map (0 for continuous).
+            action_map: Map that actions should be selected from.
 
         Returns:
             dict: Description of selected actions.
 
         """
-        actions = (actions or list(cls.AVAILABLE_ACTION_MAP.keys()))
+        action_map = action_map or {}
+        actions = (actions or list(action_map.keys())
+                   or list(cls.AVAILABLE_ACTION_MAP.keys()))
         return {
-            k: cls.AVAILABLE_ACTION_MAP[k].copy() for k in actions
+            k: action_map.get(k, cls.AVAILABLE_ACTION_MAP[k].copy())
+            for k in actions
         }
 
     def get_output_vars(self) -> List[str]:
@@ -1700,7 +1722,7 @@ class BaseModelEngine(ABC):
         return self.current_time >= self.end_time
 
     def __del__(self):
-        self.stop()
+        self.stop(cleanup=True)
 
     @property
     @abstractmethod
@@ -1741,9 +1763,18 @@ class BaseModelEngine(ABC):
         r"""Start the model engine."""
         raise NotImplementedError  # pragma: no cover
 
-    def stop(self):
-        r"""Stop the model engine."""
-        self._stop()
+    def stop(self, cleanup: Optional[bool] = False):
+        r"""Stop the model engine.
+
+        Args:
+            cleanup: If True, cleanup the generated model file.
+
+        """
+        try:
+            self._stop()
+        finally:
+            if cleanup:
+                self.model.cleanup()
 
     @abstractmethod
     def _stop(self):
@@ -2365,7 +2396,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
 
     def __init__(
             self,
-            model_file: str,
+            model_file: Optional[str] = None,
             start_time: Optional[datetime.datetime] = None,
             end_time: Optional[datetime.datetime] = None,
             intervention_interval: Optional[
@@ -2398,9 +2429,13 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         self.allow_donothing = allow_donothing
         self.exclusive = exclusive
         self.model_kwargs = kwargs
+        action_map = action_map or {}
+        actions = (
+            actions or list(action_map.keys())
+            or self.DEFAULT_ACTIONS
+        )
         self.action_map = ModelActionSet.create(
-            (action_map or self.MODEL_ENGINE_CLASS.select_actions(
-                actions or self.DEFAULT_ACTIONS)),
+            self.MODEL_ENGINE_CLASS.select_actions(actions, action_map),
             num_levels=self.num_levels,
             allow_donothing=self.allow_donothing,
             exclusive=self.exclusive,
@@ -2451,6 +2486,15 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             return self.intervention_interval
         return datetime.timedelta(self.intervention_interval)
 
+    def get_output_vars(self) -> List[str]:
+        r"""Get the output variables specified by the model file.
+
+        Returns:
+            list: Output variables
+
+        """
+        return self.output_vars
+
     def _init_log(self) -> dict:
         r"""Initialize the log."""
         return {
@@ -2479,7 +2523,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
     def create_model(self, **kwargs) -> BaseModelEngine:
         r"""Create a new model engine."""
         return self.MODEL_ENGINE_CLASS(
-            self.model_file,
+            model_file=self.model_file,
             start_time=self.start_time,
             end_time=self.end_time,
             action_map=self.action_map,
@@ -2489,7 +2533,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
 
     def close(self):
         r"""Close the environment."""
-        self.model.stop()
+        self.model.stop(cleanup=True)
         super().close()
 
     def get_llm_prompt_generator(
@@ -2553,7 +2597,10 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             raise NotImplementedError(
                 "Provide revenue_var or override the _get_reward method")
         revenue = self._get_revenue(observation)
-        cost = sum(v for v in self.log["cost"]) + self._get_cost(action)
+        cost = (
+            sum(v for v in self.log["cost"].values())
+            + self._get_cost(action)
+        )
         return revenue - cost
 
     def _get_obs(self) -> np.ndarray:

@@ -15,6 +15,22 @@ from . import logger
 class CropModelFile(BaseModelFile):
     r"""Base class for managing crop model input files."""
 
+    @classmethod
+    @abstractmethod
+    def crop2fname(cls, crop_name: str,
+                   model_dir: Optional[str] = None) -> str:
+        r"""Locate an input model file for a given crop name.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+
+        Returns:
+            str: Model input file for the specified crop.
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
     @BaseModelFile.parameter_property
     def crop_name(self):
         r"""str: Crop name."""
@@ -46,10 +62,12 @@ class BaseWeatherFile(BaseModelFile):
     r"""Base class for weather files."""
 
     _default_ext = ".json"
-    _default_start_date = datetime.date(1983, 7, 1)
+    _default_start_date = datetime.date(1981, 1, 1)
     _default_end_date = datetime.date(2026, 5, 8)
     _default_cache_dir = os.path.join(
         os.getcwd(), "nasa_power_weather_data")
+    _min_start_date = datetime.date(1981, 1, 1)
+    _max_start_date = datetime.date.today()
 
     @classmethod
     def format_NASAPower_file(cls, latitude: float, longitude: float,
@@ -78,7 +96,7 @@ class BaseWeatherFile(BaseModelFile):
             if isinstance(x, datetime.date):
                 return x.isoformat()
             elif isinstance(x, float):
-                return str(x).replace(".", "p")
+                return str(x).replace(".", "p").replace("-", "n")
             return x
 
         return os.path.join(
@@ -117,6 +135,15 @@ class BaseWeatherFile(BaseModelFile):
                 return f
         start_date = min(start_date, cls._default_start_date)
         end_date = max(end_date, cls._default_end_date)
+        assert end_date > start_date
+        if start_date < cls._min_start_date:
+            raise ValueError(
+                f"The requested start date ({start_date}) predates the "
+                f"minimum ({cls._min_start_date})")
+        if end_date > cls._max_start_date:
+            raise ValueError(
+                f"The requested end date ({end_date}) excedes the "
+                f"maximum ({cls._max_start_date})")
         fname = cls.format_NASAPower_file(latitude, longitude,
                                           start_date, end_date,
                                           cache_dir=cache_dir)
@@ -165,7 +192,6 @@ class BaseWeatherFile(BaseModelFile):
             "end": end_date.strftime("%Y%m%d"),
             "community": "AG",
             "format": "JSON",
-            "user": "anonymous",
         }
         logger.debug("Starting retrieval from NASA Power")
         req = requests.get(server, params=payload)
@@ -279,7 +305,7 @@ class CropModelEngine(BaseModelEngine):
 
     def __init__(
             self,
-            model_file: Union[str, List[str]],
+            model_file: Optional[Union[str, List[str]]] = None,
             crop_name: Optional[str] = None,
             crop_variety: Optional[str] = None,
             sow_date: Optional[datetime.date] = None,
@@ -298,6 +324,12 @@ class CropModelEngine(BaseModelEngine):
         self.longitude = longitude
         self.weather_file = weather_file
         self.nasa_power_cache_dir = nasa_power_cache_dir
+        if model_file is None:
+            if not self.crop_name:
+                raise ValueError("Either a model file or crop name must "
+                                 "be provided")
+            model_file = self.INPUT_FILE_TYPE.crop2fname(
+                self.crop_name, model_dir=kwargs.get("model_dir", None))
         super().__init__(model_file, **kwargs)
 
     def update_model_file(self):
@@ -308,7 +340,7 @@ class CropModelEngine(BaseModelEngine):
             if not self.weather_file:
                 self.weather_file = BaseWeatherFile.get_NASAPower_file(
                     self.latitude, self.longitude,
-                    self.start_date, self.end_date,
+                    self.start_time.date(), self.end_time.date(),
                     cache_dir=self.nasa_power_cache_dir,
                 )
             # TODO: Soil file?
@@ -475,6 +507,16 @@ class CropModelLLMPromptGenerator(BaseModelLLMPromptGenerator):
 class CropModelEnv(BaseModelEnv):
     r"""Crop model environment."""
 
+    def get_output_vars(self) -> List[str]:
+        r"""Get the output variables specified by the model file.
+
+        Returns:
+            list: Output variables
+
+        """
+        out = super().get_output_vars()
+        return out + ["days_elapsed"]
+
     def _get_cost(self, action: dict) -> float:
         r"""Calculate the cost of the current action.
 
@@ -511,7 +553,7 @@ class CropModelEnv(BaseModelEnv):
         """
         observation = super()._process_observation(observation)
         days_elapsed = self.model.current_time - self.model.start_time
-        observation = np.concatenate([
+        return np.concatenate([
             observation,
             [days_elapsed.days],
         ])

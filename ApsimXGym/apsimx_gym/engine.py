@@ -1,4 +1,3 @@
-# python RL-Gym/run_interactive.py run Examples/Wheat.apsimx
 import os
 import re
 import json
@@ -28,10 +27,10 @@ _datadir = os.path.join(_gymdir, "data")
 _syncfile = os.path.join(_datadir, "Synchroniser.json")
 
 
-def _read_resource(name, apsim_dir: Optional[str] = _apsimxdir):
-    if not (isinstance(apsim_dir, str) and os.path.isdir(apsim_dir)):
+def _read_resource(name, apsimx_dir: Optional[str] = _apsimxdir):
+    if not (isinstance(apsimx_dir, str) and os.path.isdir(apsimx_dir)):
         return {}
-    resource = ApsimXFile(os.path.join(apsim_dir, "Models", "Resources",
+    resource = ApsimXFile(os.path.join(apsimx_dir, "Models", "Resources",
                                        f"{name}.json"))
     return resource.find(name)
 
@@ -266,6 +265,7 @@ class ApsimXFile(CropModelFile):
                     "parameter": "CropName",
                 },
             ],
+            "fget": lambda x: x.lower(),
         },
         "crop_variety": {
             "contains": {
@@ -324,7 +324,7 @@ class ApsimXFile(CropModelFile):
                 },
             ],
             "parameter_properties": {
-                "CropName": "crop_name",
+                "CropName": "formal_crop_name",
                 "CultivarName": "crop_variety",
             },
         },
@@ -341,7 +341,7 @@ class ApsimXFile(CropModelFile):
                 },
             ],
             "parameter_properties": {
-                "CropName": "crop_name",
+                "CropName": "formal_crop_name",
                 "CultivarName": "crop_variety",
             },
         },
@@ -351,6 +351,51 @@ class ApsimXFile(CropModelFile):
     def parameter_nodes(self):
         r"""dict: Previously loaded parameter nodes."""
         return {}
+
+    @classmethod
+    def crop2fname(cls, crop_name: str,
+                   model_dir: Optional[str] = None) -> str:
+        r"""Locate an input model file for a given crop name.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+
+        Returns:
+            str: Model input file for the specified crop.
+
+        """
+        if model_dir is None:
+            model_dir = _apsimxdir
+        examples_dir = os.path.join(model_dir, "Examples")
+        for x in [crop_name, crop_name.title()]:
+            fname = os.path.join(examples_dir, f"{x}.apsimx")
+            if os.path.isfile(fname):
+                return fname
+        raise ValueError(f"Could not locate a model file for crop "
+                         f"\"{crop_name}\".")
+
+    @property
+    def formal_crop_name(self) -> str:
+        r"""str: Crop name used for resources."""
+        # TODO: Lookup resource?
+        return self.crop_name.title()
+
+    def _get_external_name(self, name: str) -> str:
+        r"""Get the external variable name from the internal variable
+        name.
+
+        Args:
+            name: Internal parameter name.
+
+        Returns:
+            str: Parameter name.
+
+        """
+        # TODO: Map variables in PARAM_NODES?
+        if name.startswith(f"[{self.formal_crop_name}]"):
+            return name.replace(f"[{self.formal_crop_name}]", "[CROP]")
+        return name
 
     def _get_internal_name(self, name: str) -> str:
         r"""Get the internal variable name from a model parameter name.
@@ -363,6 +408,9 @@ class ApsimXFile(CropModelFile):
 
         """
         if name not in self.PARAM_NODES:
+            if name.startswith("[CROP]"):
+                return name.replace("[CROP]",
+                                    f"[{self.formal_crop_name}]")
             return name
         info = self.PARAM_NODES[name]
         node = self.find_parameter(name, required=True)
@@ -376,7 +424,6 @@ class ApsimXFile(CropModelFile):
                     f"(Parameters = {names})"
                 )
             idx = names.index(field)
-            # out = f"[{self.crop_name}].{info['field']}"
             out = f"[{node['Name']}].Parameters[{idx}].Value"
         else:
             out = f"[{node['Name']}].{info['field']}"
@@ -1095,7 +1142,7 @@ class ApsimXEngine(CropModelEngine):
 
     Args:
         model_file: Path to a .apsimx model input file.
-        apsimx_dir: Path to the directory containing APSIMX installation.
+        model_dir: Path to the directory containing APSIMX installation.
         **kwargs: Additional keyword arguments are passed to the
             CropModelEngine constructor.
 
@@ -1199,19 +1246,14 @@ class ApsimXEngine(CropModelEngine):
 
     def __init__(
             self,
-            model_file: str,
-            apsimx_dir: Optional[str] = None,
+            model_file: Optional[str] = None,
+            model_dir: Optional[str] = None,
             **kwargs
     ):
-        if apsimx_dir is None:
-            apsimx_dir = _apsimxdir
-        if not (isinstance(apsimx_dir, str) and os.path.isdir(apsimx_dir)):
-            raise RuntimeError(f"APSIMX directory does not "
-                               f"exist: \"{apsimx_dir}\"")
-        self.apsimx_dir = apsimx_dir
+        if model_dir is None:
+            model_dir = _apsimxdir
         self.apsim_srv = os.path.join(
-            self.apsimx_dir, "bin", "Debug", "net8.0",
-            "ApsimZMQServer.dll")
+            model_dir, "bin", "Debug", "net8.0", "ApsimZMQServer.dll")
         self.context = None
         self.socket = None
         self.port = None
@@ -1220,10 +1262,17 @@ class ApsimXEngine(CropModelEngine):
         self.stderr_pipe = None
         self._status = None
         self._current_time = None
+        if not (isinstance(model_dir, str) and os.path.isdir(model_dir)):
+            raise RuntimeError(f"APSIMX directory does not "
+                               f"exist: \"{model_dir}\"")
         if not os.path.isfile(self.apsim_srv):
             raise RuntimeError(f"APSIMX server executable does not "
                                f"exist: \"{self.apsim_srv}\"")
-        super().__init__(model_file, **kwargs)
+        if model_file and not (os.path.isfile(model_file)
+                               or os.path.dirname(model_file)):
+            model_file = os.path.join("Examples", model_file)
+        super().__init__(model_file=model_file, model_dir=model_dir,
+                         **kwargs)
         if not self.output_dir:
             # ApsimX saves output to the directory containing the
             # model input file
@@ -1274,6 +1323,16 @@ class ApsimXEngine(CropModelEngine):
         r"""str: Path to the .db output file that will be produced."""
         return os.path.join(
             os.path.splitext(self.model.fname)[0] + ".db")
+
+    def get_output_vars(self) -> List[str]:
+        r"""Get the output variables specified by the model file.
+
+        Returns:
+            list: Output variables
+
+        """
+        out = super().get_output_vars()
+        return [self.model._get_external_name(x) for x in out]
 
     def _start(self):
         r"""Start a listening server on a random port."""
@@ -1509,14 +1568,34 @@ class ApsimXEngine(CropModelEngine):
 class ApsimXLLMPromptGenerator(CropModelLLMPromptGenerator):
     r"""ApsimX LLM prompt generator."""
 
+    # TODO: Verify units
     DEFAULT_DESC_MAP = {
-        # TODO: Handle case of different crop/non-PMF model
-        "[Wheat].Phenology.Zadok.Stage": (
-            "Crop status", "Zadok developmental tage"),
-        "[Wheat].Grain.Total.Wt": (
+        "[Clock].Today": (
+            "Timeline", "Date/time"),
+        "[CROP].LAI": (
+            "Crop status", "Leaf area index"),
+        "[CROP].Phenology.Zadok.Stage": (
+            "Crop status", "Zadok developmental stage"),
+        "[CROP].Phenology.CurrentStageName": (
+            "Crop status", "Developmental stage name"),
+        "[CROP].Total.Wt": (
+            "Crop status", "Total crop mass (kg/ha)"),
+        "[CROP].Grain.Total.Wt": (
             "Crop status", "Crop yield (g/m²)"),
-        # "[Wheat].Biomass.StorageWt": (
+        "[CROP].Grain.Protein": (
+            "Crop status", "Crop grain protein content"),
+        "[CROP].Grain.Size": (
+            "Crop status", "Crop grain size"),
+        "[CROP].Grain.Number": (
+            "Crop status", "Crop grain number"),
+        "[CROP].Grain.Total.N": (
+            "Crop status", "Crop grain nitrogen content"),
+        # "[CROP].Biomass.StorageWt": (
         #     "Crop status", "Storage organ dry matter (g/m²)"),
+        "[CROP].AboveGround.Wt": (
+            "Crop status", "Total above-ground crop mass"),
+        "[CROP].AboveGround.N": (
+            "Crop status", "Total above-ground crop nitrogen content"),
         "[Nutrient].TotalN.kgha": (
             "Soil nutrients", "Available soil nitrogen (kg/ha)"),
         "[Soil].Water.PAW": (
@@ -1534,7 +1613,7 @@ class ApsimXLLMPromptGenerator(CropModelLLMPromptGenerator):
             "Weather", "Mean air temperature (°C)"),
         "[Weather].Rain": (
             "Weather", "Daily rainfall (mm)"),
-        "[Wheat].DaysAfterSowing": ("Timeline", "Days since sowing"),
+        "[CROP].DaysAfterSowing": ("Timeline", "Days since sowing"),
     }
 
 
@@ -1545,7 +1624,7 @@ class ApsimXEnv(CropModelEnv):
     LLM_PROMPT_GENERATOR_CLASS = ApsimXLLMPromptGenerator
     DEFAULT_ACTIONS = ["nitrogen", "irrigate"]
     DEFAULT_REVENUE_VAR = {
-        "name": "[Wheat].Grain.Total.Wt",
+        "name": "[CROP].Grain.Total.Wt",
         # "name": "Yield",  # Only includes harvested weight
         # "cost": ??,  # $/kg/ha
     }
