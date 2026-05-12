@@ -188,7 +188,7 @@ class ModelAction(CachedPropertyMixin):
         r"""Set of additional parameter arguments."""
         if not self.param:
             return []
-        out = [self.param.get(k, None)
+        out = [self.param.get(k, self.param_desc[k].get("default", None))
                for k in self.additional_param]
         while out[-1] is None:
             out = out[:-1]
@@ -298,18 +298,33 @@ class ModelAction(CachedPropertyMixin):
         # TODO: Add do nothing case for strings?
         return self.levels
 
-    def set_param(self, param: dict):
+    def set_param(self, param: dict,
+                  src: Optional[str] = "set_param"):
         r"""Update the action parameters.
 
         Args:
             param: Action parameters.
+            src: Description of how the parameter is being updated for
+                logging parameter conflicts.
 
         """
-        self.param = param.copy()
-        for k, v in self.param_desc.items():
-            if ((k not in self.param and k != self.action_param
-                 and "default" in v)):
-                self.param[k] = v["default"]
+        invalid = []
+        for k, v in param.items():
+            if k not in self.param_desc or k == self.action_param:
+                invalid.append(k)
+                continue
+            if k in self.param and self.param[k] != v:
+                logger.warning(
+                    f"Parameter \"{k}\" specified via {src} "
+                    f"conflicts with the action parameter for the "
+                    f"\"{self.name}\" action. The {src} value {v} "
+                    f"will be used and the action parameter value "
+                    f"{self.param[k]} will be discarded"
+                )
+            self.param[k] = v
+        if invalid:
+            raise KeyError(f"Invalid parameters provided for action "
+                           f"\"{self.name}\": {invalid}")
         assert self.action_param not in self.param
         self._clear_cached_properties()
 
@@ -933,18 +948,36 @@ class ModelActionSet(CachedPropertyMixin):
             return
         self._clear_cached_properties()
 
-    def set_param(self, param: dict):
-        r"""Update the action parameters.
+    def set_param(self, param: dict, action: Optional[str] = None,
+                  src: Optional[str] = "set_param"):
+        r"""Update the action parameters that match the provided keywords.
 
         Args:
             param: Action parameters.
+            action: Name of the action that should be updated. If not
+                provided, all actions with matching parameters will be
+                updated.
+            src: Description of how the parameter is being updated for
+                logging parameter conflicts.
 
         """
         if not param:
             return
-        for k, v in param.items():
-            self.actions[k].set_param(v)
-        self._on_edit_actions()
+        if action:
+            self.actions[action].set_param(param, src=src)
+            self._on_edit_actions()
+            return
+        update = False
+        for action, desc in self.actions.items():
+            iparam = {
+                k: v for k, v in param.items()
+                if k in desc.param_desc and k != desc.action_param
+            }
+            if iparam:
+                update = True
+                desc.set_param(iparam, src=src)
+        if update:
+            self._on_edit_actions()
 
     def scale_action_amounts(self, scale: Union[int, float]):
         r"""Scale action limits/levels.
@@ -1303,6 +1336,8 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
     """
 
+    CACHED = False
+
     def __init__(self, fname: str, generated: Optional[bool] = False,
                  contents: Optional[dict] = None,
                  fname_orig: Optional[str] = None):
@@ -1318,7 +1353,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
     def cleanup(self):
         r"""Cleanup any generated file."""
-        if self.generated and self.exists:
+        if self.generated and self.exists and not self.CACHED:
             os.remove(self.fname)
             self.generated = False
             self._clear_cached_properties()
@@ -1552,8 +1587,10 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
         """
         if self.is_interactive:
-            logger.warn(f"Source model file \"{self.fname}\" is already "
-                        f"interactive")
+            logger.warning(
+                f"Source model file \"{self.fname}\" is already "
+                f"interactive"
+            )
             return
         with self.prevent_overwrite(suffix="-Interactive"):
             self._make_interactive(actions)
@@ -1575,6 +1612,8 @@ class BaseModelEngine(ABC):
         output_dir: Path to the directory where output should be saved.
         start_time: Simulation start time.
         end_time: Simulation end time.
+        duration: Simulation duration. Only used if either start_time or
+            end_time is not provided.
         param: Model parameters to update at the beginning of the
             simulation.
         actions: Names of actions to include. Only used if action_map
@@ -1586,7 +1625,9 @@ class BaseModelEngine(ABC):
 
     INPUT_FILE_TYPE = None
     AVAILABLE_ACTION_MAP = {}
-    EXPLICIT_PARAM = ["start_time", "end_time"]
+    EXPLICIT_PARAM = ["start_time", "end_time", "duration"]
+    DATE_PARAM = [("start_time", "end_time", "duration")]
+    DEFAULT_PARAM = {}
 
     def __init__(
             self,
@@ -1596,6 +1637,7 @@ class BaseModelEngine(ABC):
             output_dir: Optional[str] = None,
             start_time: Optional[datetime.datetime] = None,
             end_time: Optional[datetime.datetime] = None,
+            duration: Optional[datetime.timedelta] = None,
             param: Optional[dict] = None,
             actions: Optional[List[str]] = None,
             action_map: Optional[Union[dict, ModelActionSet]] = None,
@@ -1607,9 +1649,11 @@ class BaseModelEngine(ABC):
         self.output_dir = output_dir
         self.start_time = start_time
         self.end_time = end_time
+        self.duration = duration
         self.initial_param = param.copy() if param is not None else {}
         self.initial_param_static = {}
         self.initial_param_dynamic = {}
+        self.initial_param_src = {}
         self.history = defaultdict(lambda: [])
         if ((self.model_file and self.model_dir
              and (not os.path.isfile(self.model_file))
@@ -1622,40 +1666,330 @@ class BaseModelEngine(ABC):
         self.action_map = ModelActionSet.create(
             action_map or self.select_actions(actions),
         )
-        action_param = (
-            action_param.copy() if action_param is not None else {}
-        )
-        for k in self.EXPLICIT_PARAM:
-            v = getattr(self, k, None)
-            if v is None:
-                continue
-            if k in self.initial_param and self.initial_param[k] != v:
-                logger.warning(
-                    f"Parameter \"{k}\" specified as both an explicit "
-                    f"keyword argument to {type(self)} and in "
-                    f"\"param\". The keyword argument {v} will be used "
-                    f"and the param value {self.initial_param[k]} will "
-                    f"be discarded."
-                )
-            self.initial_param[k] = v
-        for k, v in self.initial_param.items():
-            for action, desc in self.action_map.items():
-                if k not in desc.param_desc or k == desc.action_param:
-                    continue
-                if ((k in action_param.get(action, {})
-                     and action_param[action][k] != v)):
-                    logger.warning(
-                        f"Parameter \"{k}\" specified as both a model "
-                        f"parameter and an action parameter for the "
-                        f"\"{action}\" action. The model parameter {v} "
-                        f"will be used and the action parameter value "
-                        f"{action_param[action][k]} will be discarded"
-                    )
-                action_param.setdefault(action, {})
-                action_param[action][k] = v
         if action_param:
-            self.action_map.set_param(action_param)
+            for k, v in action_param.items():
+                self.action_map.set_param(v, action=k)
         self.update_model_file()
+
+    def has_param(self, name: str,
+                  skip_file: Optional[bool] = False) -> bool:
+        r"""Check if a model has a parameter value set.
+
+        Args:
+            name: Name of parameter to check.
+            skip_file: If True, don't try to read the parameter from the
+                file.
+
+        Returns:
+            bool: True if the parameter is set, False otherwise.
+
+        """
+        try:
+            self.get_param(name, skip_file=skip_file)
+            return True
+        except KeyError:
+            return False
+
+    def del_param(self, name: str, src: Optional[List[str]] = None) -> bool:
+        r"""Clear a model parameter.
+
+        Args:
+            name: Name of parameter to clear.
+            src: If provided, only delete the parameter if the source is
+                 one of the listed values.
+
+        """
+        if src and not self.initial_param_src.get(name, "").startswith(src):
+            return
+        self.initial_param.pop(name, None)
+        self.initial_param_src.pop(name, None)
+        self.initial_param_static.pop(name, None)
+        self.initial_param_dynamic.pop(name, None)
+        if name in self.EXPLICIT_PARAM:
+            setattr(self, name, None)
+
+    def set_param(self, name: str, value: Any,
+                  src: Optional[str] = "USER",
+                  dont_update: Optional[bool] = False) -> bool:
+        r"""Set a model parameter, updating the value for actions where
+        appropriate.
+
+        Args:
+            name: Name of parameter to set.
+            value: Parameter value.
+            src: Description of where the parameter came from.
+            dont_update: If True, don't update the model file.
+
+        Returns:
+            bool: True if the set was successful.
+
+        """
+        if self.is_running:
+            raise KeyError(f"Cannot update initial parameter \"{name}\" "
+                           f"after the model is running")
+        self.initial_param[name] = value
+        if name in self.EXPLICIT_PARAM:
+            setattr(self, name, value)
+        self.initial_param_src[name] = src
+        if self.initial_param_static.get(name, None) != value:
+            self.initial_param_static.pop(name, None)
+        if self.initial_param_dynamic.get(name, None) != value:
+            self.initial_param_dynamic.pop(name, None)
+        other_values = {}
+        names_update = [name]
+        if name not in self.initial_param_static:
+            if name == "year":
+                for k1, k2, kdiff in self.DATE_PARAM:
+                    v1 = self.get_param(k1, None, skip_file=True)
+                    v2 = self.get_param(k2, None, skip_file=True)
+                    if v1 is not None and v2 is not None:
+                        vdiff = v2 - v1
+                    else:
+                        vdiff = self.get_param(kdiff, None,
+                                               skip_file=True)
+                    if v1 is not None:
+                        other_values[k1] = (v1, v1.replace(year=value))
+                        if vdiff is not None:
+                            other_values[k2] = (
+                                v2, other_values[k1][1] + vdiff)
+                    elif v2 is not None:
+                        other_values[k2] = (v2, v2.replace(year=value))
+                        if vdiff is not None:
+                            other_values[k1] = (
+                                v1, other_values[k2][1] - vdiff)
+            else:
+                for x in self.DATE_PARAM:
+                    if name not in x:
+                        continue
+                    for k in list(x) + ["year"]:
+                        if k == name:
+                            continue
+                        if self.initial_param_src.get(
+                                k, "").startswith("CALC"):
+                            v = self.get_param(k, None, skip_file=True)
+                            other_values[k] = (
+                                v,
+                                self.calc_param(k, None, skip_file=True)
+                            )
+        for k, (v, vnew) in other_values.items():
+            if vnew is None or v == vnew:
+                continue
+            self.set_param(
+                k, vnew,
+                src=f"{self.initial_param_src[k]}-{name}",
+                dont_update=True,
+            )
+            names_update.append(k)
+        if dont_update:
+            return True
+        return self.update_param_in_file(names_update)
+
+    def get_param(self, name: str, default: Optional[Any] = NoDefault,
+                  skip_file: Optional[bool] = False,
+                  skip_calc: Optional[bool] = False,
+                  skip_default: Optional[bool] = False,
+                  skip_src: Optional[List[str]] = None) -> Any:
+        r"""Get a model parameter.
+
+        Args:
+            name: Name of parameter to get.
+            default: Default to return if the parameter cannot be
+                located.
+            skip_file: If True, don't try to read the parameter from the
+                file.
+            skip_calc: If True, don't try to calculate missing parameters.
+            skip_default: If True, don't use values in DEFAULT_PARAM for
+                missing parameters.
+            skip_src: Set of sources that should be ignored.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            KeyError: If a parameter value cannot be located and default
+                is not provided.
+
+        """
+        if skip_src:
+            if self.initial_param_src.get(name, "").startswith(skip_src):
+                if default is not NoDefault:
+                    return default
+                raise KeyError(name)
+            if "CALC" in skip_src:
+                skip_calc = True
+            if "FILE" in skip_src:
+                skip_file = True
+            if "DEFAULT" in skip_src:
+                skip_default = True
+        if self.EXPLICIT_PARAM:
+            v = getattr(self, name, None)
+            if v is not None:
+                self.initial_param_src.setdefault(name, "ATTR")
+                if ((name in self.initial_param
+                     and self.initial_param[name] != v)):
+                    logger.warning(
+                        f"Parameter \"{name}\" specified as both an "
+                        f"explicit keyword argument to {type(self)} "
+                        f"and in \"param\". The keyword argument "
+                        f"{v} will be used and the param value "
+                        f"{self.initial_param[name]} will be discarded."
+                    )
+                return v
+        if name in self.initial_param:
+            self.initial_param_src.setdefault(name, "INIT")
+            return self.initial_param[name]
+        if not skip_calc:
+            try:
+                out = self.calc_param(name, skip_file=skip_file)
+                self.initial_param_src[name] = "CALC"
+                return out
+            except KeyError:
+                pass
+        if (not skip_default) and name in self.DEFAULT_PARAM:
+            out = self.DEFAULT_PARAM[name]
+            self.initial_param_src[name] = "DEFAULT"
+            return out
+        if not skip_file:
+            try:
+                out = self.model.get(name)
+                self.initial_param_src[name] = "FILE"
+                return out
+            except KeyError:
+                pass
+        if default is not NoDefault:
+            return default
+        raise KeyError(name)
+
+    def calc_param(self, name: str, default: Optional[Any] = NoDefault,
+                   **kwargs):
+        r"""Calculate a parameter from other parameters.
+
+        Args:
+            name: Parameter to calculate.
+            default: Default to return if the parameter cannot be
+                calculated.
+            **kwargs: Additional keyword arguments are passed to
+                get_param when getting parameters used in the
+                calculation.
+
+        Returns:
+            Calculated parameter value.
+
+        """
+        # Prevent infinite recursion
+        kws = dict(kwargs, skip_calc=True)
+        for k1, k2, kdiff in self.DATE_PARAM:
+            if name not in [k1, k2, kdiff]:
+                continue
+            try:
+                if name == k1:
+                    v2 = self.get_param(k2, **kws)
+                    vdiff = self.get_param(kdiff, **kws)
+                    out = v2 - vdiff
+                elif name == k2:
+                    v1 = self.get_param(k1, **kws)
+                    vdiff = self.get_param(kdiff, **kws)
+                    out = v1 + vdiff
+                elif name == kdiff:
+                    v1 = self.get_param(k1, **kws)
+                    v2 = self.get_param(k2, **kws)
+                    out = v2 - v1
+                return out
+            except KeyError:
+                pass
+        if default is not NoDefault:
+            return default
+        raise KeyError(name)
+
+    def update_param_in_file(
+            self, names: Optional[List[str]] = None,
+            required: Optional[bool] = False,
+    ) -> bool:
+        r"""Update a parameter in the model file if it has changed.
+
+        Args:
+            names: Names of parameters to set. If not provided, all
+                parameters that have been updated since the last time
+                update_param_in_file was called will be set.
+            required: If True, a KeyError will be raised if a value
+                cannot be updated for any of the specified names.
+
+        Returns:
+            bool: True if the update was successful.
+
+        """
+        if names is None:
+            names = list(self.initial_param.keys())
+        if self.is_running:
+            raise KeyError(f"Cannot update initial parameters "
+                           f"\"{names}\" after the model is running")
+        missing = []
+        added = {}
+        for k in names:
+            if k not in self.initial_param:
+                missing.append(k)
+                continue
+            elif k in self.initial_param_static:
+                continue
+            elif k in self.initial_param_dynamic:
+                missing.append(k)
+                continue
+            value = self.initial_param[k]
+            added[k] = value
+            try:
+                if self.initial_param_src[k] != "FILE":
+                    self.model.set(k, value)
+                self.initial_param_static[k] = value
+            except KeyError:
+                self.initial_param_dynamic[k] = value
+                missing.append(k)
+        if added:
+            self.action_map.set_param(added, src="model parameters")
+            logger.info(f"Synchronized parameters:\n"
+                        f"{pprint.pformat(added)}")
+        if required and missing:
+            raise KeyError(f"Failed to update parameters: "
+                           f"{missing}")
+        logger.info(
+            f"initial_param:\n{pprint.pformat(self.initial_param)}")
+
+    def sync_param(self, names: Optional[List[str]] = None,
+                   required: Optional[bool] = False,
+                   dont_update: Optional[bool] = False,
+                   skip_file: Optional[bool] = False, **kwargs):
+        r"""Set/get explicit model file parameters.
+
+        Args:
+            names: Names of parameters to synchronize.
+            required: If True, a KeyError will be raised if a value
+                cannot be found for any of the specified names.
+            dont_update: If True, don't update the model file.
+            skip_file: If True, only sync parameters between initial_param
+                and attributes for EXPLICIT_PARAM, but do not inspect
+                the file.
+            **kwargs: Additional keyword arguments are passed to
+                get_param for each name.
+
+        Raises:
+            KeyError: If required is True and a value cannot be found
+                for any of the specified names.
+
+        """
+        if names is None:
+            names = list(self.initial_param.keys())
+            if not skip_file:
+                names = list(set(names) | set(self.EXPLICIT_PARAM))
+        elif isinstance(names, str):
+            names = [names]
+        for k in names:
+            try:
+                v = self.get_param(k, skip_file=skip_file, **kwargs)
+            except KeyError:
+                continue
+            self.set_param(k, v, src=self.initial_param_src[k],
+                           dont_update=True)
+        if not dont_update:
+            self.update_param_in_file(names, required=required)
 
     def update_model_file(self):
         r"""Update the model file to make it interactive and set the
@@ -1665,24 +1999,14 @@ class BaseModelEngine(ABC):
         if self.output_dir or self.model_suffix:
             self.model.move(directory=self.output_dir,
                             suffix=self.model_suffix)
-        for k, v in self.initial_param.items():
-            try:
-                self.model.set(k, v)
-                self.initial_param_static[k] = v
-            except KeyError:
-                self.initial_param_dynamic[k] = v
-        added = {}
-        for k in self.EXPLICIT_PARAM:
-            if getattr(self, k, None) is not None:
-                continue
-            try:
-                setattr(self, k, self.model.get(k))
-                added[k] = getattr(self, k)
-            except KeyError:
-                continue
-        if added:
-            logger.info(f"Updated attributes from model file:\n"
-                        f"{pprint.pformat(added)}")
+        self.sync_param()
+        for k1, k2, kdiff in self.DATE_PARAM:
+            v1 = getattr(self, k1, None)
+            v2 = getattr(self, k2, None)
+            if v1 is not None and v2 is not None and v1 >= v2:
+                raise ValueError(f"{k2} ({v2}) does "
+                                 f"not come after {k1} "
+                                 f"({v1})")
         if not self.model.exists:
             self.model.write()
 
@@ -1746,17 +2070,17 @@ class BaseModelEngine(ABC):
         self._start()
         self.setvars(self.initial_param_dynamic)
         logger.info(f"Simulating from {self.start_time} to {self.end_time}")
-        added = {}
-        for k in self.EXPLICIT_PARAM:
-            v = getattr(self, k, None)
-            if v is not None:
-                continue
-            setattr(self, k, self.get(k, allow_error=True))
-            if getattr(self, k) is not None:
-                added[k] = getattr(self, k)
-        if added:
-            logger.info(f"Updated attributes from running model:\n"
-                        f"{pprint.pformat(added)}")
+        # added = {}
+        # for k in self.EXPLICIT_PARAM:
+        #     v = getattr(self, k, None)
+        #     if v is not None:
+        #         continue
+        #     setattr(self, k, self.get(k, allow_error=True))
+        #     if getattr(self, k) is not None:
+        #         added[k] = getattr(self, k)
+        # if added:
+        #     logger.info(f"Updated attributes from running model:\n"
+        #                 f"{pprint.pformat(added)}")
 
     @abstractmethod
     def _start(self):
@@ -2442,7 +2766,8 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             default_action_map=self.MODEL_ENGINE_CLASS.AVAILABLE_ACTION_MAP,
         )
         if action_param:
-            self.action_map.set_param(action_param)
+            for k, v in action_param.items():
+                self.action_map.set_param(v, action=k)
         if scale_action_amounts_by_interval:
             self.action_map.scale_action_amounts(
                 float(self.intervention_interval.days)

@@ -104,6 +104,8 @@ class TestApsimXEngine:
         r"""Test loop to apply fertilizer and irrigate."""
         with new_instance(
                 latitude=40.1164, longitude=-88.2434,
+                start_time=datetime.datetime(year=1984, month=7, day=1),
+                end_time=datetime.datetime(year=1985, month=5, day=5),
         ) as instance:
             i = 0
             orig_value = 0.05
@@ -151,7 +153,7 @@ class TestApsimXEngine:
         end_time = instance.end_time
         # start_time = datetime.datetime(year=1981, month=1, day=1)
         # end_time = datetime.datetime(year=1981, month=11, day=5)
-        time = datetime.datetime(year=1981, month=5, day=23)
+        time = start_time.replace(month=5, day=23)
         # Run complete simulation without fertilizing
         assert instance.current_time == start_time
         instance.fast_forward()
@@ -190,7 +192,7 @@ class TestApsimXEngine:
                     "nitrogen", "irrigate", "tillage", "sow", "harvest"
                 ],
                 action_param={
-                    "sow": {"population": 10.0, "cropName": "Wheat"},
+                    "sow": {"population": 10.0, "crop_name": "Wheat"},
                 },
         ) as instance:
             instance.act("tillage", "disc")

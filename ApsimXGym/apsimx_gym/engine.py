@@ -38,9 +38,8 @@ def _read_resource(name, apsimx_dir: Optional[str] = _apsimxdir):
 class ApsimXWeatherFile(BaseWeatherFile):
     r"""Container for ApsimX weather data."""
 
+    _default_ext = ".met"
     _power_names = {
-        "year": "TOA_SW_DWN",
-        "day": "TOA_SW_DWN",
         "radn": "ALLSKY_SFC_SW_DWN",
         "maxt": "T2M_MAX",
         "mint": "T2M_MIN",
@@ -48,8 +47,6 @@ class ApsimXWeatherFile(BaseWeatherFile):
         "vp": "T2MDEW",
     }
     _conv = {
-        "year": lambda x: pd.to_datetime(x, "%Y%m%d").year,
-        "day": lambda x: pd.to_datetime(x, "%Y%m%d").dayofyear,
         # From PCSE
         # Allen, R.G., Pereira, L.S., Raes, D. and Smith, M. (1998) Crop
         #     evapotranspiration. Guidelines for computing crop water
@@ -80,30 +77,28 @@ class ApsimXWeatherFile(BaseWeatherFile):
             object: File contents.
 
         """
-        # return pd.read_csv(fname)
         out = {
-            "constants": {}
+            "constants": {},
+            "units": {},
         }
         with open(fname, "r") as fd:
-            for line in fd.readline():
-                if not line.startswith("[weather.met.weather]"):
-                    continue
-            for line in fd.readline():
+            for line in fd:
+                if line.startswith("[weather.met.weather]"):
+                    break
+            for line in fd:
                 if line.startswith("!"):
                     continue
                 elif line.startswith("year"):
                     names = line.split()
-                    out["units"] = {
-                        k: x.strip("()")
-                        for k, x in zip(names, fd.readline().split())
-                    }
+                    for k, x in zip(names, fd.readline().split()):
+                        out["units"][k] = x.strip("()")
                     out["columns"] = pd.read_csv(
                         fd, sep=r"\s+", names=names,
                     )
                 else:
                     pattern = (
-                        r"(?P<name>\w+)\s+\=\s+(?P<value>\d+(\.\d+)?)\s+"
-                        r"\((?P<units>(\w[\w\/\^]*)?)\)"
+                        r"(?P<name>\w+)\s+\=\s+(?P<value>[+-]?\d+(\.\d+)?)\s+"
+                        r"\((?P<units>(\w[\w\/\^ ]*)?)\)"
                     )
                     match = re.search(pattern, line)
                     if not match:
@@ -126,26 +121,28 @@ class ApsimXWeatherFile(BaseWeatherFile):
         """
         out = ["[weather.met.weather]"]
         if "constants" in contents:
-            for k, v in contents["constants"]:
+            for k, v in contents["constants"].items():
                 out.append(f"{k} = {v} ({contents['units'].get(k, '')})")
+        column_order = ["year", "day"]
+        column_order += [k for k in contents["columns"].columns
+                         if k not in column_order]
         units = {
             k: f"({contents['units'].get(k, '')})"
-            for k in contents["columns"].columns
+            for k in column_order
         }
-        col_space = {k: max(len(k), len(v)) for k, v in units.keys()}
-        for k in list(units.keys()):
+        col_space = {k: max(len(k), len(v)) for k, v in units.items()}
+        for k in column_order:
             v = units[k]
             pad = (col_space[k] - len(v)) * " "
             units[k] += pad
         head, body = contents["columns"].to_string(
-            index=False, col_space=col_space,
+            index=False, col_space=col_space, columns=column_order,
         ).split("\n", maxsplit=1)
         out.append(head)
         out.append(" " + " ".join(list(units.values())))
         out.append(body)
         with open(fname, "w") as fd:
             fd.write("\n".join(out))
-        # contents.to_csv(fname, index=False)
 
     @classmethod
     def _from_power(cls, src: dict):
@@ -173,14 +170,46 @@ class ApsimXWeatherFile(BaseWeatherFile):
         for k, v in cls._power_names.items():
             s = pd.Series(src["properties"]["parameter"][v])
             s[s == fill_value] = np.nan
-            if k in cls._conv:
-                s = cls._conv[k](s)
             columns[k] = s
+        for k, v in cls._conv.items():
+            columns[k] = v(columns[k])
         columns = pd.DataFrame(columns)
+        date = pd.to_datetime(columns.index, format="%Y%m%d")
+        columns["year"] = date.year
+        columns["day"] = date.dayofyear
         ix = columns.isnull().any(axis=1)
         columns = columns[~ix]
         out["columns"] = columns
         return out
+
+    @readonly_cached_property
+    def dates(self) -> np.ndarray:
+        r"""np.ndarray: Dates covered by this file."""
+        return (
+            (self.contents["columns"]["year"].to_numpy() - 1970).astype(
+                "datetime64[Y]")
+            + (self.contents["columns"]["day"].to_numpy() - 1).astype(
+                "timedelta64[D]")
+        )
+
+    @readonly_cached_property
+    def latitude(self) -> float:
+        r"""float: Latitude (degrees)."""
+        return self.contents["constants"]["latitude"]
+
+    @readonly_cached_property
+    def longitude(self) -> float:
+        r"""float: Longitude (degrees)."""
+        return self.contents["constants"]["longitude"]
+
+    def _make_interactive(self, actions: list):
+        r"""Modify this file to make it interactive.
+
+        Args:
+            actions: List of actions that should be enabled.
+
+        """
+        pass
 
 
 class ApsimXFile(CropModelFile):
@@ -242,6 +271,8 @@ class ApsimXFile(CropModelFile):
         for k in ["fertilize", "nitrogen", "calcium", "phosphorus"]
     })
     PARAM_NODES = {
+        "duration": False,
+        "season_length": False,
         "output_vars": {
             "contains": {
                 "$type": "Models.Report, Models",
@@ -264,6 +295,14 @@ class ApsimXFile(CropModelFile):
                     "contains": {"Name": "SowOrHarvestByDate"},
                     "parameter": "CropName",
                 },
+                {
+                    "calls": "Sow",
+                    "parameter": "Crop",
+                },
+                {
+                    "calls": "Harvest",
+                    "parameter": "Crop",
+                },
             ],
             "fget": lambda x: x.lower(),
         },
@@ -273,6 +312,19 @@ class ApsimXFile(CropModelFile):
             },
             "calls": "Sow",
             "parameter": "CultivarName",
+        },
+        "year": {
+            "fget": lambda x: x.year,
+            "anyOf": [
+                {"internal": "start_time",
+                 "fset_prev": lambda x, prev: prev.replace(year=x)},
+                {"internal": "end_time",
+                 "fset_prev": lambda x, prev: prev.replace(year=x)},
+                {"internal": "sow_date",
+                 "fset_prev": lambda x, prev: prev.replace(year=x)},
+                {"internal": "harvest_date",
+                 "fset_prev": lambda x, prev: prev.replace(year=x)},
+            ],
         },
         "start_time": {
             "contains": {"Name": "Clock"},
@@ -289,7 +341,7 @@ class ApsimXFile(CropModelFile):
                 "$type": "Models.Climate.Weather, Models",
             },
             "field": "FileName",
-            "fset": ApsimXWeatherFile.convert_NASAPower,
+            "fget": lambda x: x.replace("%root%", _apsimxdir),
         },
         # "soil_file": {
         # }
@@ -480,6 +532,8 @@ class ApsimXFile(CropModelFile):
             out = cls._get_node_parameter(node, info["parameter"])
         elif "field" in info:
             out = node[info["field"]]
+        elif "internal" in info:
+            out = cls._get_parameter(node, cls.PARAM_NODES[info["internal"]])
         elif "anyOf" in info:
             for x in info["anyOf"]:
                 if cls.node_matches(node, **x):
@@ -511,10 +565,16 @@ class ApsimXFile(CropModelFile):
                 value = info["fset"](value)
             except ValueError as e:
                 raise KeyError(e)
+        if "fset_prev" in info:
+            prev = cls._get_parameter(node, info)
+            value = info["fset_prev"](value, prev)
         if "parameter" in info:
             cls._set_node_parameter(node, info["parameter"], value)
         elif "field" in info:
             node[info["field"]] = value
+        elif "internal" in info:
+            cls._set_parameter(node, cls.PARAM_NODES[info["internal"]],
+                               value)
         elif "anyOf" in info:
             for x in info["anyOf"]:
                 if cls.node_matches(node, **x):
@@ -564,22 +624,26 @@ class ApsimXFile(CropModelFile):
             KeyError: If name is not a valid parameter name.
 
         """
-        node = self.find_parameter(
-            name, required=True,
-            add_missing=(info is None),
-            info=info,
-        )
+        add_missing = (info is None)
         if info is None:
             info = self.PARAM_NODES[name]
+        if info is False:
+            return
         try:
-            self._set_parameter(node, info, value)
+            anyset = False
             for xnode in self.findall_parameters(name, info=info):
-                if xnode == node:
-                    continue
                 try:
                     self._set_parameter(xnode, info, value)
+                    anyset = True
                 except KeyError:
                     continue
+            if not anyset:
+                node = self.find_parameter(
+                    name, required=True,
+                    add_missing=add_missing,
+                    info=info,
+                )
+                self._set_parameter(node, info, value)
         except KeyError as e:
             raise KeyError(f"{name}: {e}")
 
@@ -751,9 +815,18 @@ class ApsimXFile(CropModelFile):
             self.generated = False
 
     @classmethod
-    def includes_constraints(cls, info: dict):
+    def includes_constraints(cls, info: dict) -> bool:
+        r"""Check if a set of node requirements constrain the node.
+
+        Args:
+            info: Node requirements.
+
+        Returns:
+            bool: True if info constrains the node, False otherwise.
+
+        """
         return any(k in info for k in [
-            "name", "field", "parameter", "contains",
+            "name", "field", "parameter", "internal", "contains",
             "equals", "fvalid", "calls", "anyOf", "nested"])
 
     @classmethod
@@ -762,6 +835,7 @@ class ApsimXFile(CropModelFile):
                      name: Optional[str] = None,
                      field: Optional[str] = None,
                      parameter: Optional[str] = None,
+                     internal: Optional[str] = None,
                      contains: Optional[Union[list, set, dict]] = None,
                      equals: Optional[Any] = None,
                      fvalid: Optional[Callable] = None,
@@ -822,6 +896,9 @@ class ApsimXFile(CropModelFile):
              and not any(x["Key"] == parameter
                          for x in node.get("Parameters", [])))):
             if not add_error(f"{node} is missing parameter \"{parameter}\""):
+                return False
+        if internal:
+            if not cls.node_matches(node, **cls.PARAM_NODES[internal]):
                 return False
         if contains:
             if isinstance(contains, str):
@@ -948,6 +1025,8 @@ class ApsimXFile(CropModelFile):
                 self.PARAM_NODES[name] if name in self.PARAM_NODES
                 else self.ACTION_NODES[name]
             )
+        if info is False:
+            raise KeyError(f"Ignored parameter \"{name}\"")
         if ((name in self.parameter_nodes
              and not kwargs.get("parent", False))):
             return self.parameter_nodes[name]
@@ -1359,7 +1438,10 @@ class ApsimXEngine(CropModelEngine):
             self.process.stderr, prefix="APSIMX", level="ERROR")
         logger.info(f"Started APSIMX process id: {self.process.pid}")
         assert self.status == "connect"
-        assert self.status == "paused"
+        if self.status != "paused":
+            self.stop(cleanup=True)
+            raise AssertionError(f"Server is not awaiting instructions: "
+                                 f"status = \"{self.status}\"")
         if self.start_time is None:
             self.start_time = self.get("[Clock].Start")
         else:
@@ -1372,11 +1454,14 @@ class ApsimXEngine(CropModelEngine):
     def _stop(self):
         r"""Stop the listening server and close the communication port."""
         if self.is_operable:
-            self.act("terminate")
-            if self.status != "finished":
-                raise ValueError(
-                    f"Status after terminate is \"{self.status}\"")
-            self._status = "terminated"
+            try:
+                self.act("terminate")
+                if self.status != "finished":
+                    raise ValueError(
+                        f"Status after terminate is \"{self.status}\"")
+                self._status = "terminated"
+            except ModelEngineError:
+                pass
         if self.socket is not None:
             self.socket.close()
         if self.process is not None:
