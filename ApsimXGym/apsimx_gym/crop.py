@@ -171,13 +171,17 @@ class BaseWeatherFile(BaseModelFile):
 
     def covers_range(self,
                      start: Union[datetime.date, datetime.datetime],
-                     end: Union[datetime.date, datetime.datetime]):
+                     end: Union[datetime.date, datetime.datetime],
+                     latitude: Optional[float] = None,
+                     longitude: Optional[float] = None):
         r"""Check if the file contains data for the specified date/time
         range.
 
         Args:
             start: Start of range.
             end: End of range.
+            latitude: Latitude that data should cover.
+            longitude: Longitude that data should cover.
 
         Returns:
             bool: True if the range is covered, False otherwise.
@@ -189,6 +193,10 @@ class BaseWeatherFile(BaseModelFile):
             end = end.date()
         start_date = self.start_date
         end_date = self.end_date
+        if latitude is not None and self.latitude != latitude:
+            return False
+        if longitude is not None and self.longitude != longitude:
+            return False
         return (start >= start_date and start < end_date
                 and end > start_date and end <= end_date)
 
@@ -532,7 +540,7 @@ class CropModelEngine(BaseModelEngine):
         self.sync_param("weather_file", dont_update=True)
         download_weather_file = False
         if self.weather_file and not os.path.isfile(self.weather_file):
-            logger.warning(
+            logger.info(
                 f"The specified weather file (\"{self.weather_file}\") "
                 f"does not exist. Weather data will be downloaded from "
                 f"NASA POWER."
@@ -541,19 +549,27 @@ class CropModelEngine(BaseModelEngine):
             download_weather_file = True
         elif self.weather_file:
             weather_file = self.WEATHER_FILE_TYPE(self.weather_file)
-            if not weather_file.covers_range(self.start_time,
-                                             self.end_time):
-                logger.warning(
+            latitude = self.get_param("latitude", None, skip_file=True)
+            longitude = self.get_param("longitude", None, skip_file=True)
+            if not weather_file.covers_range(
+                    self.start_time, self.end_time,
+                    latitude=latitude, longitude=longitude,
+            ):
+                logger.info(
                     f"The provided weather file (valid for "
                     f"{weather_file.start_date} to "
-                    f"{weather_file.end_date}) does not cover "
-                    f"the simulation range ({self.start_time} to "
-                    f"{self.end_time}). Weather data will be "
-                    f"downloaded from NASA POWER."
+                    f"{weather_file.end_date}, "
+                    f"latitude={weather_file.latitude}, "
+                    f"longitude={weather_file.longitude}) does not "
+                    f"cover the simulation range ({self.start_time} to "
+                    f"{self.end_time}, latitude={latitude}, "
+                    f"longitude={longitude}). "
+                    f"Weather data will be downloaded from NASA POWER."
                 )
                 self.del_param("weather_file")
                 download_weather_file = True
-        elif self.has_param("latitude") or self.has_param("longitude"):
+        elif (self.has_param("latitude", skip_file=True)
+              or self.has_param("longitude", skip_file=True)):
             download_weather_file = True
         if download_weather_file:
             self.sync_param(["latitude", "longitude"],

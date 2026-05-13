@@ -1,4 +1,4 @@
-# python RL-Gym/run_interactive.py run Examples/Wheat.apsimx
+# python -m apsimx_gym.cli run Examples/Wheat.apsimx
 import os
 import sys
 import argparse
@@ -15,7 +15,7 @@ def run(model, **kwargs):
     apsim.start()
     try:
         i = 0
-        while apsim.status != 'finished':
+        while apsim.is_running and not apsim.is_complete:
             logger.info(f"Time: {apsim.current_time}")
             apsim.getvars([
                 "[Wheat].Phenology.Zadok.Stage",
@@ -31,8 +31,7 @@ def run(model, **kwargs):
             # apsim.set("[Nutrient].NO3.kgha", new_value)
             # reply = apsim.get("[Nutrient].NO3.kgha")
             # assert reply == new_value
-            next_time = apsim.current_time + datetime.timedelta(days=10)
-            apsim.resume(until=next_time)
+            apsim.fast_forward(datetime.timedelta(days=10))
             i += 1
     finally:
         apsim.stop()
@@ -50,7 +49,10 @@ def create_interactive_apsimx(src, dst=None):
     """
     if not isinstance(src, ApsimXFile):
         src = ApsimXFile(src)
-    dst = src.make_interactive(dst=dst)
+    dst = src.copy(dst=dst)
+    actions = list(ApsimXEngine.AVAILABLE_ACTION_MAP.keys())
+    dst.make_interactive(actions)
+    dst.write()
 
 
 def main():
@@ -66,7 +68,7 @@ def main():
         help="Path to a .apsimx model input file",
     )
     parser_run.add_argument(
-        "--apsim-dir", type=str,
+        "--apsimx-dir", type=str,
         help=(
             "Path to the root directory containing a APSIMX "
             "installation (i.e. the directory that contains "
@@ -107,7 +109,7 @@ def main():
     if args.log_file:
         print(f"Log being written to \"{args.log_file}\"")
     if args.action == "run":
-        run(args.model, apsim_dir=args.apsim_dir)
+        run(args.model, model_dir=args.apsimx_dir)
     elif args.action == "apsimx":
         if args.dst is None:
             args.dst = '-Interactive'.join(os.path.splitext(args.model))

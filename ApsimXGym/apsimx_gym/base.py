@@ -1596,8 +1596,13 @@ class BaseModelFile(CachedPropertyMixin, ABC):
             self._make_interactive(actions)
 
     @abstractmethod
-    def _make_interactive(self):
-        r"""Modify this file to make it interactive."""
+    def _make_interactive(self, actions: list):
+        r"""Modify this file to make it interactive.
+
+        Args:
+            actions: List of actions that should be enabled.
+
+        """
         raise NotImplementedError  # pragma: no cover
 
 
