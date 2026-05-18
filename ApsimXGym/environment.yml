@@ -1,0 +1,14 @@
+name: apsimx
+channels:
+  - conda-forge
+dependencies:
+  - dotnet
+  - flake8
+  - gymnasium
+  - msgpack
+  - numpy
+  - pandas
+  - python
+  - pytest
+  - pytest-cov
+  - pyzmq
