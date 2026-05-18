@@ -2,10 +2,10 @@ name: apsimx
 channels:
   - conda-forge
 dependencies:
-  - dotnet
+  - dotnet<9.0.0
   - flake8
   - gymnasium
-  - msgpack
+  - msgpack-python
   - numpy
   - pandas
   - python
