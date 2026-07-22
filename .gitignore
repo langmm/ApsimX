@@ -1,5 +1,14 @@
+# Python
+__pycache__/
+# Cached weather data
+nasa_power_weather_data/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
 # Emacs
 *~
+# Mac
+*.DS_Store
 #ignore thumbnails created by windows
 Thumbs.db
 #Ignore files build by Visual Studio

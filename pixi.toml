@@ -1,0 +1,53 @@
+[workspace]
+authors = ["Meagan Lang <langmm.astro@gmail.com>"]
+channels = ["conda-forge"]
+name = "apsimx"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[environments]
+default = ["apsimx_gym"]
+fastapi = ["apsimx_gym", "apsimngpy", "fastapi"]
+
+[tasks]
+build = "dotnet build ./ApsimX.sln"
+build-server = "dotnet build ./APSIM.Server/ZMQ+msgpack/APSIM.ZMQServer.csproj"
+build-cli = "dotnet build ./APSIM.Cli/APSIM.Cli.csproj"
+build-models = "dotnet build ./Models/Models.csproj"
+build-docker-n8n = "docker build -f n8n_tool/Dockerfile -t apsimx ."
+run-docker-n8n = "docker run -p 5000:5000 -e PORT=5000 apsimx"
+
+[dependencies]
+dotnet = "<9.0.0"
+zeromq = "*"
+pytest = "*"
+pytest-cov = "*"
+python = "*"
+
+[feature.apsimx_gym.dependencies]
+flake8 = "*"
+gymnasium = "*"
+msgpack-python = "*"
+numpy = "*"
+pandas = "*"
+pyzmq = "*"
+
+[feature.apsimx_gym.pypi-dependencies]
+apsimx_gym = { path = "./ApsimXGym", editable = true }
+
+[feature.apsimx_gym.tasks]
+test = "pytest -svx ./ApsimXGym/tests/"
+
+[feature.apsimngpy.dependencies]
+pythonnet = "*"
+
+[feature.apsimngpy.pypi-dependencies]
+apsimNGpy = "*"
+
+[feature.fastapi.dependencies]
+fastapi = "*"
+pydantic = "*"
+
+[feature.fastapi.tasks]
+start-server = "export PORT=5000 && ./n8n_tool/launch_local.sh"
+test = "pytest -svx n8n_tool/tests/"

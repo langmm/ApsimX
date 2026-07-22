@@ -1,15 +1,20 @@
-name: apsimx
+name: apsimx-n8n
 channels:
   - conda-forge
 dependencies:
   - dotnet<9.0.0
+  - fastapi
   - flake8
+  - gtk3
   - gymnasium
   - msgpack-python
   - numpy
   - pandas
-  - python
+  - pydantic
+  - pydantic-settings
   - pytest
   - pytest-cov
+  - python
+  - pythonnet
   - pyzmq
   - requests

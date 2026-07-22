@@ -1030,6 +1030,7 @@ class ApsimXFile(CropModelFile):
         if ((name in self.parameter_nodes
              and not kwargs.get("parent", False))):
             return self.parameter_nodes[name]
+        node = None
         try:
             node = self.find(requirements=info, **kwargs)
             if add_missing and not node:

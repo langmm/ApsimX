@@ -15,7 +15,8 @@ logger.setLevel(logging.INFO)
 class TestApsimXEngine:
 
     @pytest.fixture(scope="class")
-    def default_instance_kwargs(self, apsimx_dir):
+    @classmethod
+    def default_instance_kwargs(cls, apsimx_dir):
         return {
             "crop_name": "Wheat",
             "actions": ["nitrogen", "irrigate"],
@@ -25,7 +26,8 @@ class TestApsimXEngine:
         }
 
     @pytest.fixture(scope="class")
-    def new_instance(self, example_model, default_instance_kwargs):
+    @classmethod
+    def new_instance(cls, example_model, default_instance_kwargs):
 
         @contextlib.contextmanager
         def _new_instance(model_file=None, **kwargs):
@@ -45,7 +47,8 @@ class TestApsimXEngine:
         return _new_instance
 
     @pytest.fixture(scope="class")
-    def instance(self, new_instance):
+    @classmethod
+    def instance(cls, new_instance):
         with new_instance(model_suffix="-Prime") as instance:
             yield instance
 
@@ -207,7 +210,8 @@ class TestApsimXEnv:
     r"""Test use of ApsimXEnv for exclusive, discrete actions."""
 
     @pytest.fixture(scope="class")
-    def default_instance_kwargs(self, apsimx_dir):
+    @classmethod
+    def default_instance_kwargs(cls, apsimx_dir):
         return {
             "model_dir": apsimx_dir,
             "start_time": datetime.datetime(year=1981, month=1, day=1),
@@ -215,7 +219,8 @@ class TestApsimXEnv:
         }
 
     @pytest.fixture(scope="class")
-    def new_instance(self, example_model, default_instance_kwargs):
+    @classmethod
+    def new_instance(cls, example_model, default_instance_kwargs):
 
         @contextlib.contextmanager
         def _new_instance(model_file=None, **kwargs):
@@ -234,16 +239,19 @@ class TestApsimXEnv:
         return _new_instance
 
     @pytest.fixture(scope="class")
-    def instance(self, new_instance):
+    @classmethod
+    def instance(cls, new_instance):
         with new_instance(model_suffix="-Prime") as instance:
             yield instance
 
     @pytest.fixture(scope="class")
-    def sampled_action_id(self, instance):
+    @classmethod
+    def sampled_action_id(cls, instance):
         return instance.action_map.space.sample()
 
     @pytest.fixture(params=[0, 1])
-    def action_id(self, request):
+    @classmethod
+    def action_id(cls, request):
         r"""int: Action ID."""
         return request.param
 
@@ -254,7 +262,8 @@ class TestApsimXEnv:
         },
         (1, np.array([0.5])),
     ])
-    def invalid_action_id(self, request):
+    @classmethod
+    def invalid_action_id(cls, request):
         r"""int: Action ID."""
         return request.param
 
@@ -303,7 +312,8 @@ class TestApsimXEnvContinuous(TestApsimXEnv):
     r"""Test use of ApsimXEnv with exclusive, continuous actions."""
 
     @pytest.fixture(scope="class")
-    def default_instance_kwargs(self, apsimx_dir):
+    @classmethod
+    def default_instance_kwargs(cls, apsimx_dir):
         return {
             "model_dir": apsimx_dir,
             "start_time": datetime.datetime(year=1981, month=1, day=1),
@@ -335,7 +345,8 @@ class TestApsimXEnvSimultaneous(TestApsimXEnv):
     r"""Test use of ApsimXEnv with non-exclusive, continuous actions."""
 
     @pytest.fixture(scope="class")
-    def default_instance_kwargs(self, apsimx_dir):
+    @classmethod
+    def default_instance_kwargs(cls, apsimx_dir):
         return {
             "model_dir": apsimx_dir,
             "start_time": datetime.datetime(year=1981, month=1, day=1),

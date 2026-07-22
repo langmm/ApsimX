@@ -20,6 +20,7 @@ dependencies = [
     "numpy>=1.13.0",
     "pandas",
     "pyzmq",
+    "requests",
 ]
 
 description = "Gym environment for reinforcement learning using ApsimX"

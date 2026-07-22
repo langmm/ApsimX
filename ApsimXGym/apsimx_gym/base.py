@@ -2300,9 +2300,40 @@ class BaseModelEngine(ABC):
         """
         self.history[self.current_time].append(args)
 
+    def scrub(
+            self, time: Union[datetime.datetime,
+                              datetime.timedelta,
+                              int, str]
+    ):
+        r"""Fast forwrad or rewind the simulation to the desired time.
+
+        Args:
+            time: Time that simulation should be run/rewond to or the the
+                time that the simulation should be run for with negative
+                value indicating the time that the simulation should be
+                rewond by (timedelta). If an integer is provided, it is
+                assumed to be the number of days in a timedelta.
+
+        """
+        if isinstance(time, int):
+            time = datetime.timedelta(days=time)
+        elif isinstance(time, str):
+            time = datetime.datetime.fromisoformat(time)
+        if isinstance(time, datetime.timedelta):
+            if time < datetime.timedelta(days=0):
+                self.rewind(time=-time)
+            else:
+                self.fast_forward(time=time)
+        else:
+            if time < self.current_time:
+                self.rewind(time=time)
+            else:
+                self.fast_forward(time=time)
+
     def fast_forward(
             self, time: Optional[Union[datetime.datetime,
-                                       datetime.timedelta]] = None
+                                       datetime.timedelta,
+                                       int, str]] = None
     ):
         r"""Fast forward the simulation to the desired time.
 
@@ -2313,7 +2344,11 @@ class BaseModelEngine(ABC):
         """
         if time is None:
             time = self.end_time
-        elif isinstance(time, datetime.timedelta):
+        elif isinstance(time, int):
+            time = datetime.timedelta(days=time)
+        elif isinstance(time, str):
+            time = datetime.datetime.fromisoformat(time)
+        if isinstance(time, datetime.timedelta):
             time = min(self.current_time + time, self.end_time)
         if time <= self.current_time:
             return
@@ -2332,7 +2367,8 @@ class BaseModelEngine(ABC):
             self.resume(wait=True)
 
     def rewind(self, time: Optional[Union[datetime.datetime,
-                                          datetime.timedelta]] = None):
+                                          datetime.timedelta,
+                                          int, str]] = None):
         r"""Rewind the simulation to a previous time.
 
         Args:
@@ -2341,7 +2377,11 @@ class BaseModelEngine(ABC):
         """
         if time is None:
             time = self.start_time
-        elif isinstance(time, datetime.timedelta):
+        elif isinstance(time, int):
+            time = datetime.timedelta(days=time)
+        elif isinstance(time, str):
+            time = datetime.datetime.fromisoformat(time)
+        if isinstance(time, datetime.timedelta):
             time = max(self.current_time - time, self.start_time)
         if time < self.start_time:
             logger.warning(f"Cannot rewind to {time} from "
