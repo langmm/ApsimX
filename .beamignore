@@ -37,3 +37,5 @@ n8n_tool/
 !n8n_tool/main.py
 !n8n_tool/launch_local.sh
 !n8n_tool/environment.yml
+!n8n_tool/Dockerfile
+!n8n_tool/beam_app.py

@@ -1,9 +1,11 @@
+import os
 from beam import Image, asgi
+_n8n_dir = os.path.abspath(os.path.dirname(__file__))
 
 
 image = Image().from_dockerfile(
-    "./Dockerfile",
-    context=".."
+    os.path.join(_n8n_dir, "Dockerfile"),
+    context_dir=os.path.dirname(_n8n_dir),
 )
 
 
