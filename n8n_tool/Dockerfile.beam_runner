@@ -1,0 +1,85 @@
+FROM ubuntu:22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN <<EOT
+echo 'Acquire::ForceIPv4 "true";' | tee /etc/apt/apt.conf.d/1000-force-ipv4-transport
+apt-get update
+apt-get install -y software-properties-common curl git gcc python3-dev bzip2 openssh-server
+add-apt-repository ppa:deadsnakes/ppa
+apt-get update
+EOT
+
+# Micromamba-base
+# ========================
+FROM base AS micromamba-base
+
+WORKDIR /workspace
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NVIDIA_VISIBLE_DEVICES=all \
+    PATH=/micromamba/bin:$PATH \
+    MAMBA_ROOT_PREFIX=/micromamba \
+    MAMBA_EXE=/bin/micromamba \
+    SHELL=/bin/bash
+
+SHELL ["/bin/bash", "-c"]
+RUN <<EOT
+set -eux
+
+VERSION="2.0.2"
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    MAMBA_ARCH="64"
+elif [ "$ARCH" = "aarch64" ]; then
+    MAMBA_ARCH="aarch64"
+else
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+fi
+
+curl -L "https://micro.mamba.pm/api/micromamba/linux-${MAMBA_ARCH}/${VERSION}" \
+| tar -xj -C "/" "bin/micromamba"
+
+mkdir -p /micromamba
+
+sh -c 'echo "#!/bin/sh\nexec micromamba run -n beta9 python3 \"\$@\""' > /micromamba/mpy
+chmod +x /micromamba/mpy
+
+apt-get clean -y
+apt-get autoremove -y
+rm -rf /var/lib/apt/lists/*
+rm -rf /usr/share/doc
+rm -rf /usr/share/man
+rm -rf /usr/share/locale
+rm -rf /root/.cache/*
+rm -rf /tmp/*
+EOT
+
+
+VOLUME ["/volumes", "/snapshot"]
+
+# Micromamba final
+# ========================
+ARG PYTHON_VERSION=3.11
+FROM micromamba-base AS micromamba
+
+WORKDIR /workspace
+
+COPY --from=micromamba-base /micromamba /micromamba
+
+# Copy local repository
+COPY . /workspace/ApsimX/
+
+RUN <<EOT
+set -eux
+
+/bin/micromamba create -n beta9 python=${PYTHON_VERSION} -y
+/bin/micromamba run -n beta9 pip install -r /workspace/ApsimX/n8n_tool/beam_cloud_base_requirements.txt
+
+ln -sf /micromamba/mpy /usr/bin/micromamba${PYTHON_VERSION}
+
+/bin/micromamba clean --all --yes
+EOT
+
+VOLUME ["/volumes", "/snapshot"]

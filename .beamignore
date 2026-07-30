@@ -4,6 +4,7 @@
 *~
 *.DS_Store
 **/__pycache__/
+**/*.egg-info/
 *.svg
 *.png
 *.dll
@@ -29,9 +30,7 @@ Tests/
 Prototypes/
 Docs/
 Dockerfiles/
-Documentation/
 
-.dockerignore
 .beamignore
 n8n_tool/
 !n8n_tool/main.py
@@ -39,3 +38,4 @@ n8n_tool/
 !n8n_tool/environment.yml
 !n8n_tool/Dockerfile
 !n8n_tool/beam_app.py
+!n8n_tool/beam_cloud_base_requirements.txt

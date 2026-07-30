@@ -1,36 +1,134 @@
+import os
 import copy
+import time
 import pytest
 import requests
 import datetime
+import contextlib
+from subprocess import Popen
+_n8n_dir = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+_apsimx_dir = os.path.dirname(_n8n_dir)
 
 
 @pytest.fixture(scope="session")
-def address():
-    return "http://0.0.0.0:5000"
+def ping_address():
+
+    def _ping_address(address):
+        try:
+            r = requests.get(f"{address}/docs")
+            r.raise_for_status()
+            return True
+        except requests.exceptions.ConnectionError:
+            return False
+
+    return _ping_address
+
+
+@pytest.fixture(scope="session")
+def local_address(ping_address):
+    out = "http://0.0.0.0:5000"
+    if ping_address(out):
+        yield out
+    else:
+        docker = False
+        if docker:
+            cmd = "docker run -p 5000:8000 apsimx"
+        else:
+            cmd = "fastapi run --host 0.0.0.0 --port 5000 main.py"
+        p = Popen(
+            cmd.split(),
+            cwd=_n8n_dir,
+            env=dict(
+                os.environ,
+                APSIMX_DIR=_apsimx_dir,
+            ),
+        )
+        try:
+            while p.poll() is None and not ping_address(out):
+                time.sleep(1)
+            yield out
+        finally:
+            if p.poll() is None:
+                p.terminate()
+                p.kill()
+            else:
+                assert p.returncode == 0
+
+
+@pytest.fixture(scope="session", params=[
+    "local",
+    "remote",
+])
+def address(local_address, request, ping_address):
+    if request.param == "local":
+        out = local_address
+    else:
+        out = (
+            "https://bcec6924-4cb6-44b4-9563-456e567f3777-8000"
+            ".app.beam.cloud"
+        )
+    if not ping_address(out):
+        pytest.skip(f"Could not connect to \"{out}\"")
+    yield out
+
+
+@pytest.fixture(scope="session")
+def running_interactive_model(address):
+
+    @contextlib.contextmanager
+    def _running_interactive_model(request, dont_stop=False):
+        r = requests.post(f'{address}/start-interactive',
+                          json=request)
+        r.raise_for_status()
+        idstr = r.json()
+        model_address = f'{address}/interactive-model/{idstr}'
+        try:
+            yield idstr
+            if not dont_stop:
+                r = requests.post(f'{model_address}/stop')
+                r.raise_for_status()
+        except BaseException:
+            r = requests.post(f'{address}/stop-interactive')
+            r.raise_for_status()
+            raise
+
+    return _running_interactive_model
 
 
 @pytest.fixture(scope="session")
 def base_model_request():
     return {
         "crop_name": "Wheat",
-        "crop_variety": "Hartog",
-        "latitude": 40.1164,
-        "longitude": -88.2434,
-        "year": 1991,
-        "start_date": "1991-01-01T00:00:00",
-        "end_date": "1991-11-05T00:00:00",
-        "output_vars": [
-            "[Wheat].Grain.Total.Wt",
-        ],
     }
 
 
 def test_model(address, base_model_request):
-    expected = pytest.approx(404.70110106813866, rel=1e-3)
+    expected = pytest.approx(309.2315738609009, rel=1e-3)
     r = requests.post(f'{address}/start', json=base_model_request)
     r.raise_for_status()
     response = r.json()
     assert max(response['[Wheat].Grain.Total.Wt']) == expected
+
+
+def test_model_interactive(address, base_model_request,
+                           running_interactive_model):
+    with running_interactive_model(base_model_request) as idstr:
+        model_address = f'{address}/interactive-model/{idstr}'
+        r = requests.post(f'{model_address}/complete')
+        r.raise_for_status()
+        assert r.json() == {"status": "success"}
+
+
+def test_model_interactive_timeout(address, base_model_request,
+                                   running_interactive_model):
+    request = copy.deepcopy(base_model_request)
+    request.update(timeout=1)
+    with running_interactive_model(request, dont_stop=True) as idstr:
+        model_address = f'{address}/interactive-model/{idstr}'
+        time.sleep(2)
+        r = requests.get(f'{model_address}/status')
+        r.raise_for_status()
+        assert r.json() == {"status": "stopped"}
 
 
 class TestInteractiveModel:
@@ -38,9 +136,17 @@ class TestInteractiveModel:
     @pytest.fixture(scope="class")
     @classmethod
     def model_request(cls, base_model_request):
-        request = copy.deepcopy(base_model_request)
-        request['action_step'] = 10
-        request['actions'] = ["nitrogen"]
+        request = {
+            "crop_name": "Wheat",
+            "crop_variety": "Hartog",
+            "latitude": 40.1164,
+            "longitude": -88.2434,
+            "year": 1991,
+            "start_time": "1991-01-01T00:00:00",
+            "end_time": "1991-11-05T00:00:00",
+            "timestep": 10,
+            "actions": ["nitrogen"],
+        }
         return request
 
     @pytest.fixture(scope="class")
@@ -55,11 +161,12 @@ class TestInteractiveModel:
         assert isinstance(idstr, str)
         try:
             yield idstr
-            r = requests.post(f'{address}/{idstr}/stop')
+            r = requests.post(f'{address}/interactive-model/{idstr}/stop')
             r.raise_for_status()
         except BaseException:
             r = requests.post(f'{address}/stop-interactive')
             r.raise_for_status()
+            raise
 
     @pytest.fixture(scope="class")
     @classmethod

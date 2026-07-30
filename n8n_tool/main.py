@@ -1,14 +1,16 @@
 import os
 import re
+import uuid
 import datetime
-from pydantic import BaseModel
+import asyncio
+import contextlib
+from pydantic import BaseModel, PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from fastapi import FastAPI, HTTPException
 import logging
 
 
 logging.basicConfig(level=logging.INFO)
-interactive_models = {}
 
 
 class Settings(BaseSettings):
@@ -16,26 +18,136 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
 
 
-settings = Settings()
+class InteractiveModelRegistry:
+
+    def __init__(self):
+        self._models = {}
+        self._lock = asyncio.Lock()
+        self._in_use = []
+
+    @contextlib.asynccontextmanager
+    async def valid_model(self, idstr, allow_stopped=False):
+        model = None
+        async with self._lock:
+            if idstr not in self._models:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No model with id \"{idstr}\"",
+                )
+            self._in_use.append(idstr)
+            model = self._models[idstr]
+        async with model._model_lock:
+            try:
+                if not (allow_stopped or model._model.is_running):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Model \"{idstr}\" is no longer running")
+                yield model
+            finally:
+                async with self._lock:
+                    self._in_use.remove(idstr)
+
+    async def add(self, model):
+        async with self._lock:
+            assert model._idstr not in self._models
+            self._models[model._idstr] = model
+
+    async def _safe_remove(self, idstr, dont_stop=False):
+        if idstr not in self._models:
+            return True
+        if idstr in self._in_use:
+            return False
+        model = self._models[idstr]
+        async with model._model_lock:
+            if model._model.is_running and not dont_stop:
+                model._model.stop()
+            if not (dont_stop and model._model.is_running):
+                del self._models[idstr]
+        return True
+
+    async def remove(self, idstr, **kwargs):
+        while True:
+            async with self._lock:
+                if await self._safe_remove(idstr, **kwargs):
+                    return
+
+    async def clear(self, ids=None, **kwargs):
+        while True:
+            async with self._lock:
+                if ids is None:
+                    ids = list(self._models.keys())
+                if not any(idstr in self._models for idstr in ids):
+                    return
+                ids = [
+                    idstr for idstr in ids
+                    if not await self._safe_remove(idstr, **kwargs)
+                ]
+
+    async def size(self):
+        async with self._lock:
+            return len(self._models)
 
 
 # Request payload for API, declared with Pydantic
 class ModelInput(BaseModel):
     crop_name: str
-    crop_variety: str
-    latitude: float
-    longitude: float
-    year: int
-    # TODO: ISO datestrings, but can these be datetime.datetime?
-    start_date: str
-    end_date: str
-    # sow_date: str
-    # harvest_date: str
-    output_vars: list
+    crop_variety: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    year: int | None = None
+    start_time: str | datetime.datetime | None = None
+    end_time: str | datetime.datetime | None = None
+    # sow_date: str | datetime.datetime | None = None
+    # harvest_date: str | datetime.datetime | None = None
+    timestep: int | datetime.timedelta | None = None
+    trace_vars: list = ["[Wheat].Grain.Total.Wt"]
+    _model: PrivateAttr(default=None)
+    _trace: PrivateAttr(default=None)
+
+    @field_validator('start_time', 'end_time')  # 'sow_date', 'harvest_date')
+    @classmethod
+    def check_datetime(cls, v):
+        if isinstance(v, str):
+            return datetime.datetime.fromisoformat(v)
+        return v
+
+    @field_validator('timestep')
+    @classmethod
+    def check_timedelta(cls, v):
+        if isinstance(v, int):
+            if v <= 0:
+                return None
+            return datetime.timedelta(days=v)
+        return v
+
+    def model_post_init(self, context):
+        self._model = None
+        self._trace = None
+        return super().model_post_init(context)
+
+    def log_and_continue(self, wait: bool = False):
+        if not (self._model and self._model.is_running
+                and not self._model.is_complete):
+            return
+        idata = None
+        if self.trace_vars:
+            idata = self._model.getvars(self.trace_vars)
+        if self.timestep is None:
+            self._model.resume(wait=wait)
+        else:
+            self._model.fast_forward(self.timestep)
+        if self.trace_vars:
+            if self._trace is None:
+                self._trace = {k: [v] for k, v in idata.items()}
+            else:
+                for k, v in idata.items():
+                    self._trace[k].append(v)
 
     def run_apsimngpy(self):
-        # TODO: Handle additional parameters:
-        #   crop_variety, sow_date, harvest_date, output_vars
+        # TODO:
+        #   - Debug runtime where there is an error in pythonnet
+        #   - Handle additional parameters:
+        #       crop_variety, sow_date, harvest_date, trace_vars
         from apsimNGpy.core.apsim import ApsimModel
         LONLAT = (self.latitude, self.longitude)
         with ApsimModel(self.crop_name) as model:
@@ -53,192 +165,194 @@ class ModelInput(BaseModel):
             return model.results.to_json()
 
     def start_apsim_engine(self, **kwargs):
+        assert not self._model
         from apsimx_gym.engine import ApsimXEngine
+        kwargs.update(self.model_dump(
+            exclude_none=True,
+            exclude=["timestep", "trace_vars", "timeout"],
+        ))
         kwargs.setdefault("actions", ["irrigate"])
-        model = ApsimXEngine(
-            crop_name=self.crop_name,
-            crop_variety=self.crop_variety,
-            latitude=self.latitude,
-            longitude=self.longitude,
-            year=self.year,
-            start_time=datetime.datetime.fromisoformat(self.start_date),
-            end_time=datetime.datetime.fromisoformat(self.end_date),
-            # sow_date=datetime.datetime.fromisoformat(self.sow_date),
-            # harvest_date=datetime.datetime.fromisoformat(self.harvest_date),
-            model_dir=settings.apsimx_dir,
-            **kwargs
-        )
-        model.start()
-        return model
+        self._model = ApsimXEngine(**kwargs)
+        self._model.start()
 
     def run_apsim_engine(self, **kwargs):
-        model = self.start_apsim_engine(**kwargs)
+        self.start_apsim_engine(**kwargs)
         try:
-            data = model.getvars(self.output_vars)
-            model.resume()
-            data = {k: [v] for k, v in data.items()}
-            while model.is_running and not model.is_complete:
-                idata = model.getvars(self.output_vars)
-                model.resume()
-                for k, v in idata.items():
-                    data[k].append(v)
+            while self._model.is_running and not self._model.is_complete:
+                self.log_and_continue()
         finally:
-            model.stop()
-        return data
+            self._model.stop()
+        return self._trace
 
 
 class InteractiveModelInput(ModelInput):
-    action_step: int  # days
-    actions: list
+    # TODO: Return trace/results?
+    trace_vars: list | None = None
+    actions: list = ["irrigate"]
+    timeout: int = 300
+    _idstr: PrivateAttr(default=None)
+    _model_lock: PrivateAttr(default=None)
+    _model_accessed: PrivateAttr(default=None)
+    _shutdown_after_wait: PrivateAttr(default=None)
 
-    def start_apsim(self, **kwargs):
-        # TODO: Pass action_step
-        import uuid
-        idstr = str(uuid.uuid4())
-        model = self.start_apsim_engine(actions=self.actions, **kwargs)
-        interactive_models[idstr] = model
-        return idstr
-
-
-class InteractiveModelInputBase(BaseModel):
-
+    @field_validator('timeout')
     @classmethod
-    def check_model(cls, idstr, allow_stopped=False):
-        if idstr not in interactive_models:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No model with id \"{idstr}\"",
-            )
-        model = interactive_models[idstr]
-        if not (allow_stopped or model.is_running):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model \"{idstr}\" is no longer running")
-        return model
+    def check_timeout(cls, v):
+        if v < 0 or v > 300:
+            return 300
+        return v
 
-    def _do(self, model):
-        raise NotImplementedError
+    def start_apsim_engine(self, **kwargs):
+        super().start_apsim_engine(**kwargs)
+        self._idstr = str(uuid.uuid4())
+        self._model_lock = asyncio.Lock()
+        self._model_accessed = asyncio.Event()
+        self._shutdown_after_wait = asyncio.create_task(
+            self.shutdown_after_wait())
 
-    def do(self, idstr):
-        model = self.check_model(idstr)
-        return self._do(model)
+    async def shutdown_after_wait(self):
+        is_running = True
+        while is_running:
+            if self._model_lock is None:
+                return
+            async with self._model_lock:
+                if self._model is None:
+                    return
+                is_running = self._model.is_running
+            if not is_running:
+                break
+            try:
+                async with asyncio.timeout(self.timeout):
+                    await self._model_accessed.wait()
+                self._model_accessed.clear()
+            except TimeoutError:
+                if is_running:
+                    async with self._model_lock:
+                        if self._model.is_running:
+                            self._model.stop()
+                        assert not self._model.is_running
+                break
 
 
-class ModelSetInput(InteractiveModelInputBase):
+class ModelSetInput(BaseModel):
 
     values: dict
 
-    def _do(self, model):
-        model.setvars(self.values)
-        return {"status": "success"}
 
-
-class ModelGetInput(InteractiveModelInputBase):
+class ModelGetInput(BaseModel):
 
     names: list
 
-    def _do(self, model):
-        return model.getvars(self.names)
 
-
-class ModelActionInput(InteractiveModelInputBase):
+class ModelActionInput(BaseModel):
 
     action_name: str
     action_param: dict
 
-    def _do(self, model):
-        model.act(self.action_name, **self.action_param)
-        return {"status": "success"}
-
 
 app = FastAPI()
+settings = Settings()
+interactive_models = InteractiveModelRegistry()
 
 
 # Others async?
+@app.get("/")
+async def status():
+    return (
+        f"This is an ApsimX server with {interactive_models.size()} "
+        f"interactive models currently running"
+    )
+
+
 @app.post("/start")
 async def start_model(input: ModelInput):
-    return input.run_apsim_engine()
-    # return input.run_apsimngpy()
+    return input.run_apsim_engine(model_dir=settings.apsimx_dir)
+
+
+# @app.post("/start")
+# async def start_apsimngpy_model(input: ModelInput):
+#     return input.run_apsimngpy()
 
 
 @app.post("/start-interactive")
-def start_interactive_model(input: InteractiveModelInput):
-    idstr = input.start_apsim()
-    return idstr
+async def start_interactive_model(input: InteractiveModelInput):
+    input.start_apsim_engine(model_dir=settings.apsimx_dir)
+    await interactive_models.add(input)
+    return input._idstr
 
 
 @app.post("/stop-interactive")
-def stop_interactive_models():
-    for k, v in interactive_models.items():
-        if v.is_running:
-            v.stop()
-    interactive_models.clear()
+async def stop_interactive_models():
+    await interactive_models.clear()
 
 
 @app.post("/prune-interactive")
-def prune_interactive_models():
-    stopped = [k for k, v in interactive_models.items()
-               if not v.is_running]
-    for k in stopped:
-        del interactive_models[k]
+async def prune_interactive_models():
+    await interactive_models.clear(dont_stop=True)
 
 
 @app.get("/interactive-model/{idstr}/status")
-def interactive_model_status(idstr: str):
-    model = InteractiveModelInputBase.check_model(idstr, allow_stopped=True)
-    if not model.is_running:
-        return {"status": "stopped"}
-    return {"status": "running",
-            "time": model.current_time}
+async def interactive_model_status(idstr: str):
+    async with interactive_models.valid_model(idstr,
+                                              allow_stopped=True) as model:
+        if not model._model.is_running:
+            return {"status": "stopped"}
+        return {"status": "running",
+                "time": model._model.current_time}
 
 
 @app.put("/interactive-model/{idstr}")
-def interactive_model_set(idstr: str, input: ModelSetInput):
-    return input.do(idstr)
+async def interactive_model_set(idstr: str, input: ModelSetInput):
+    async with interactive_models.valid_model(idstr) as model:
+        model._model.setvars(input.values)
+        return {"status": "success"}
 
 
 @app.get("/interactive-model/{idstr}")
-def interactive_model_get(idstr: str, input: ModelGetInput):
-    return input.do(idstr)
+async def interactive_model_get(idstr: str, input: ModelGetInput):
+    async with interactive_models.valid_model(idstr) as model:
+        return model._model.getvars(input.names)
 
 
 @app.post("/interactive-model/{idstr}/act")
-def interactive_model_act(idstr: str, input: ModelActionInput):
-    return input.do(idstr)
+async def interactive_model_act(idstr: str, input: ModelActionInput):
+    async with interactive_models.valid_model(idstr) as model:
+        model._model.act(input.action_name, **input.action_param)
+        return {"status": "success"}
 
 
 @app.post("/interactive-model/{idstr}/continue")
-def interactive_model_continue(idstr: str):
-    model = InteractiveModelInputBase.check_model(idstr)
-    model.resume(wait=True)
-    return {"status": "success"}
+async def interactive_model_continue(idstr: str):
+    async with interactive_models.valid_model(idstr) as model:
+        model.log_and_continue(wait=True)
+        return {"status": "success"}
 
 
 @app.post("/interactive-model/{idstr}/complete")
-def interactive_model_complete(idstr: str):
-    model = InteractiveModelInputBase.check_model(idstr)
-    model.fast_forward()
-    return {"status": "success"}
+async def interactive_model_complete(idstr: str):
+    async with interactive_models.valid_model(idstr) as model:
+        model._model.fast_forward()
+        return {"status": "success"}
 
 
 @app.post("/interactive-model/{idstr}/restart")
-def interactive_model_restart(idstr: str):
-    model = InteractiveModelInputBase.check_model(idstr)
-    model.rewind()
-    return {"status": "success"}
+async def interactive_model_restart(idstr: str):
+    async with interactive_models.valid_model(idstr) as model:
+        model._model.rewind()
+        return {"status": "success"}
 
 
 @app.post("/interactive-model/{idstr}/stop")
-def interactive_model_stop(idstr: str):
-    model = InteractiveModelInputBase.check_model(idstr)
-    model.stop()
-    return {"status": "success"}
+async def interactive_model_stop(idstr: str):
+    async with interactive_models.valid_model(idstr) as model:
+        model._model.stop()
+        return {"status": "success"}
 
 
 @app.post("/interactive-model/{idstr}/scrub")
-def interactive_model_scrub(idstr: str, time: int | str):
-    model = InteractiveModelInputBase.check_model(idstr)
-    if isinstance(time, str) and re.fullmatch(r'[-+]?[1-9][0-9]*', time):
-        time = int(time)
-    model.scrub(time)
-    return {"status": "success"}
+async def interactive_model_scrub(idstr: str, time: int | str):
+    async with interactive_models.valid_model(idstr) as model:
+        if isinstance(time, str) and re.fullmatch(r'[-+]?[1-9][0-9]*', time):
+            time = int(time)
+        model._model.scrub(time)
+        return {"status": "success"}
