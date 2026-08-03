@@ -1,0 +1,90 @@
+{
+  "name": "ApsimX start Form Trigger",
+  "type": "n8n-nodes-base.formTrigger",
+  "typeVersion": 2.1,
+  "parameters": {
+    "path": "apsimx-start-form",
+    "formTitle": "Run ApsimX start",
+    "formFields": {
+      "values": [
+        {
+          "fieldLabel": "Crop Name that will be simulated",
+          "fieldName": "crop_name",
+          "fieldType": "text",
+          "requiredField": true
+        },
+        {
+          "fieldLabel": "Crop Variety that will be simulated",
+          "fieldName": "crop_variety",
+          "fieldType": "text",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Latitude used to get weather data (degrees)",
+          "fieldName": "latitude",
+          "fieldType": "number",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Longitude used to get weather data (degrees)",
+          "fieldName": "longitude",
+          "fieldType": "number",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Year used to get weather data. Overrides the year in the default/provided start_time, end_time, sow_date, and/or harvest_date",
+          "fieldName": "year",
+          "fieldType": "number",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Start Time of simulation (ISO 8601 format)",
+          "fieldName": "start_time",
+          "fieldType": "date",
+          "formatDate": "YYYY-MM-DD",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "End Time of simulation (ISO 8601 format)",
+          "fieldName": "end_time",
+          "fieldType": "date",
+          "formatDate": "YYYY-MM-DD",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Sow Date for the simulated crop (ISO 8601 format)",
+          "fieldName": "sow_date",
+          "fieldType": "date",
+          "formatDate": "YYYY-MM-DD",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Harvest Date for the simulated crop (ISO 8601 format)",
+          "fieldName": "harvest_date",
+          "fieldType": "date",
+          "formatDate": "YYYY-MM-DD",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "Timestep between records of state variables (days)",
+          "fieldName": "timestep",
+          "fieldType": "number",
+          "requiredField": false
+        },
+        {
+          "fieldLabel": "State Variables that should be recorded at each reported time step (comma separated list)",
+          "fieldName": "state_variables",
+          "fieldType": "text",
+          "placeholder": "[Clock].Today,[Wheat].Grain.Total.Wt",
+          "defaultValue": "[Clock].Today,[Wheat].Grain.Total.Wt",
+          "requiredField": false
+        }
+      ],
+      "options": {}
+    }
+  },
+  "position": [
+    600,
+    380
+  ]
+}

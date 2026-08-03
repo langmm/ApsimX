@@ -48,9 +48,23 @@ The asgi version does not work currently and causes the following error
 /micromamba/envs/beta9/bin/python3: Error while finding module specification for 'beta9.runner.serve' (ModuleNotFoundError: No module named 'beta9')
 ```
 
-# TODO:
-- Redeploy
-- Move pydantic classes into separate file or adjust entry point
-- Script to regenerate & submit n8n form from pydantic
+To create an n8n tool that uses the apsimx model service
 
+```
+export X_N8N_API_KEY=<N8N_CREDENTIALS>
+python n8n_tool/make_n8n_form.py --name start --publish-for-address <BEAM_URL>
+```
+
+Procedure on update:
+  - Redeploy to beam
+  - Update address in remote testing & test
+  - Update address in n8n workflow (TODO: Add option to do this via the n8n API)
+
+# TODO short term:
+- Add api key based security when using pod deployment & redeploy
+- Debug why workflow created via n8n API does not show up on the workflow dashboard
+- Add option to upload a crop model file?
+
+# TODO long term
+- Move apsimx_gym into pydantic models to allow autogeneration of n8n forms
 - Test build with different version of Python?

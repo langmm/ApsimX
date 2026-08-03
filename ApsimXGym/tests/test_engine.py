@@ -42,7 +42,7 @@ class TestApsimXEngine:
                 yield instance
             finally:
                 instance.stop()
-                instance.model.cleanup()
+                instance.cleanup(remove_output=True)
 
         return _new_instance
 
@@ -234,7 +234,7 @@ class TestApsimXEnv:
                 yield env
             finally:
                 env.close()
-                env.model.model.cleanup()
+                env.model.cleanup(remove_output=True)
 
         return _new_instance
 

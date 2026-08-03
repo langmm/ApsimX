@@ -5,7 +5,7 @@ RUN conda config --add channels conda-forge && \
     conda config --set channel_priority strict
 
 # Copy local repository
-COPY --exclude=./n8n_tool/main.py --exclude=./n8n_tool/launch_local.sh --exclude=./ApsimXGym . /ApsimX/
+COPY --exclude=./n8n_tool/main.py --exclude=./n8n_tool/config.py --exclude=./n8n_tool/launch_local.sh --exclude=./ApsimXGym . /ApsimX/
 WORKDIR /ApsimX
 
 # Create environment
@@ -29,6 +29,7 @@ RUN conda run -n apsimx pip install -e .
 # Launch
 WORKDIR /home
 COPY ./n8n_tool/main.py .
+COPY ./n8n_tool/config.py .
 COPY ./n8n_tool/launch_local.sh .
 
 ARG APP_PORT=8000

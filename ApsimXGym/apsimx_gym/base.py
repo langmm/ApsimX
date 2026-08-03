@@ -1655,6 +1655,7 @@ class BaseModelEngine(ABC):
         self.start_time = start_time
         self.end_time = end_time
         self.duration = duration
+        self.products = []
         self.initial_param = param.copy() if param is not None else {}
         self.initial_param_static = {}
         self.initial_param_dynamic = {}
@@ -2104,6 +2105,18 @@ class BaseModelEngine(ABC):
         finally:
             if cleanup:
                 self.model.cleanup()
+
+    def cleanup(self, remove_output: Optional[bool] = False):
+        r"""Cleanup the model."""
+        self.model.cleanup()
+        if remove_output:
+            self.cleanup_output()
+
+    def cleanup_output(self):
+        r"""Cleanup model output."""
+        for x in self.products:
+            if os.path.isfile(x):
+                os.remove(x)
 
     @abstractmethod
     def _stop(self):

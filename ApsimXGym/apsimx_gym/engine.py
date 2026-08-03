@@ -1357,6 +1357,11 @@ class ApsimXEngine(CropModelEngine):
             # ApsimX saves output to the directory containing the
             # model input file
             self.output_dir = os.path.dirname(self.model.fname)
+        self.products += [
+            self.output_file,
+            f"{self.output_file}-shm",
+            f"{self.output_file}-wal"
+        ]
 
     @property
     def is_running(self):

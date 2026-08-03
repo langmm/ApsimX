@@ -1,4 +1,5 @@
 import os
+import json
 import copy
 import time
 import pytest
@@ -64,7 +65,7 @@ def address(local_address, request, ping_address):
         out = local_address
     else:
         out = (
-            "https://bcec6924-4cb6-44b4-9563-456e567f3777-8000"
+            "https://66202345-1ca8-4b56-9fb7-abb6e439a4db-8000"
             ".app.beam.cloud"
         )
     if not ping_address(out):
@@ -87,10 +88,8 @@ def running_interactive_model(address):
             if not dont_stop:
                 r = requests.post(f'{model_address}/stop')
                 r.raise_for_status()
-        except BaseException:
+        finally:
             r = requests.post(f'{address}/stop-interactive')
-            r.raise_for_status()
-            raise
 
     return _running_interactive_model
 
@@ -112,17 +111,25 @@ def test_model(address, base_model_request):
 
 def test_model_interactive(address, base_model_request,
                            running_interactive_model):
-    with running_interactive_model(base_model_request) as idstr:
+    request = copy.deepcopy(base_model_request)
+    request.update(actions=["irrigate"])
+    with running_interactive_model(request) as idstr:
         model_address = f'{address}/interactive-model/{idstr}'
         r = requests.post(f'{model_address}/complete')
         r.raise_for_status()
         assert r.json() == {"status": "success"}
+        # Disabled until the report generation can be debugged
+        # r = requests.get(f'{model_address}/results')
+        # r.raise_for_status()
+        # print(r.content)
+        # import pdb; pdb.set_trace()
+        # assert r.content
 
 
 def test_model_interactive_timeout(address, base_model_request,
                                    running_interactive_model):
     request = copy.deepcopy(base_model_request)
-    request.update(timeout=1)
+    request.update(wait_time=1)
     with running_interactive_model(request, dont_stop=True) as idstr:
         model_address = f'{address}/interactive-model/{idstr}'
         time.sleep(2)
@@ -145,28 +152,16 @@ class TestInteractiveModel:
             "start_time": "1991-01-01T00:00:00",
             "end_time": "1991-11-05T00:00:00",
             "timestep": 10,
-            "actions": ["nitrogen"],
+            "actions": "nitrogen,irrigate",
+            "state_variables": "[Clock].Today,[Wheat].Grain.Total.Wt",
         }
         return request
 
     @pytest.fixture(scope="class")
     @classmethod
-    def idstr(cls, address, model_request):
-        r = requests.post(
-            f'{address}/start-interactive',
-            json=model_request
-        )
-        r.raise_for_status()
-        idstr = r.json()
-        assert isinstance(idstr, str)
-        try:
+    def idstr(cls, model_request, running_interactive_model):
+        with running_interactive_model(model_request) as idstr:
             yield idstr
-            r = requests.post(f'{address}/interactive-model/{idstr}/stop')
-            r.raise_for_status()
-        except BaseException:
-            r = requests.post(f'{address}/stop-interactive')
-            r.raise_for_status()
-            raise
 
     @pytest.fixture(scope="class")
     @classmethod
@@ -192,21 +187,21 @@ class TestInteractiveModel:
         # Get
         r = requests.get(
             interactive_address,
-            json={"names": list(value0.keys())}
+            json={"state_variables": ",".join(list(value0.keys()))}
         )
         r.raise_for_status()
         assert r.json() == value0
         # Set
         r = requests.put(
             interactive_address,
-            json={"values": value1}
+            json={"values": json.dumps(value1)}
         )
         r.raise_for_status()
         assert r.json() == {"status": "success"}
         # Get
         r = requests.get(
             interactive_address,
-            json={"names": list(value0.keys())}
+            json={"state_variables": ",".join(list(value0.keys()))}
         )
         r.raise_for_status()
         assert r.json() == value1
@@ -225,15 +220,22 @@ class TestInteractiveModel:
         t1 = self.current_time(interactive_address)
         assert t1 > t0
 
+    def test_trace(self, interactive_address):
+        r = requests.get(f'{interactive_address}/trace')
+        r.raise_for_status()
+        response = r.json()
+        assert '[Clock].Today' in response
+        assert '[Wheat].Grain.Total.Wt' in response
+
     def test_act(self, interactive_address):
         r"""Test performing an action."""
         r = requests.post(
             f'{interactive_address}/act',
             json={
-                "action_name": "nitrogen",
-                "action_param": {
+                "action": "nitrogen",
+                "parameters": json.dumps({
                     "amount": 160.0,  # kg/ha
-                },
+                }),
             }
         )
         r.raise_for_status()

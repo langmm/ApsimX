@@ -38,3 +38,4 @@ n8n_tool/
 !n8n_tool/launch_local.sh
 !n8n_tool/environment.yml
 !n8n_tool/beam_cloud_base_requirements.txt
+!n8n_tool/config.py
