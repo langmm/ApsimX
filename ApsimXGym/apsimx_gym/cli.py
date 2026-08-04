@@ -38,27 +38,10 @@ def run(model, **kwargs):
     print(f"Output written to {apsim.output_file}")
 
 
-def create_interactive_apsimx(src, dst=None):
-    r"""Create an interactive version of a .apsimx model.
-
-    Args:
-        src (str, ApsimXFile): Path to the source .apsimx model.
-        dst (str, optional): Path to the location where the generated
-            interactive .apsimx model should be saved.
-
-    """
-    if not isinstance(src, ApsimXFile):
-        src = ApsimXFile(src)
-    dst = src.copy(dst=dst)
-    actions = list(ApsimXEngine.AVAILABLE_ACTION_MAP.keys())
-    dst.make_interactive(actions)
-    dst.write()
-
-
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(
-        dest="action", help='subcommand help')
+        dest="action", help='Action to perform')
     # For running
     parser_run = subparsers.add_parser(
         "run", help="Run a simulation"
@@ -67,29 +50,49 @@ def main():
         "model", type=str,
         help="Path to a .apsimx model input file",
     )
-    parser_run.add_argument(
-        "--apsimx-dir", type=str,
-        help=(
-            "Path to the root directory containing a APSIMX "
-            "installation (i.e. the directory that contains "
-            "\"bin/Debug/net8.0/ApsimZMQServer.dll\""
-        ),
-        default=_apsimxdir,
-    )
     # For creating interactive .apsimx
     parser_apsimx = subparsers.add_parser(
-        "apsimx", help="Create an interactive version of a .apsimx model"
+        "apsimx", help="Create a .apsimx model input file"
+        # interactive version of a .apsimx model"
     )
     parser_apsimx.add_argument(
-        "model", type=str,
+        "crop_name", type=str,  # choices=
         help="Path to a .apsimx model input file",
     )
     parser_apsimx.add_argument(
+        "--from-example", type=str, nargs="?", const=True, default=False,
+        help=(
+            "Create a new .apsimx model by copying an example. "
+            "The path to the example can be passed."
+        ),
+    )
+    parser_apsimx.add_argument(
+        "--interactive", action="store_true",
+        help="Make the new file interactive",
+    )
+    parser_apsimx.add_argument(
+        "--actions", type=str, nargs="+", action="extend",
+        help="Interactive actions that should be supported",
+    )
+    parser_apsimx.add_argument(
         "--dst", type=str,
-        help="Path to where the interactive .apsimx file should be saved"
+        help="Path to where the new .apsimx file should be saved",
+    )
+    parser_apsimx.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite any existing file",
     )
     # Generic arguments
     for x_parser in [parser_run, parser_apsimx]:
+        x_parser.add_argument(
+            "--apsimx-dir", type=str,
+            help=(
+                "Path to the root directory containing a APSIMX "
+                "installation (i.e. the directory that contains "
+                "\"bin/Debug/net8.0/ApsimZMQServer.dll\""
+            ),
+            default=_apsimxdir,
+        )
         x_parser.add_argument(
             "--log-file", type=str, nargs="?", const=True,
             help="File where log message should be written",
@@ -111,9 +114,18 @@ def main():
     if args.action == "run":
         run(args.model, model_dir=args.apsimx_dir)
     elif args.action == "apsimx":
-        if args.dst is None:
-            args.dst = '-Interactive'.join(os.path.splitext(args.model))
-        create_interactive_apsimx(args.model, args.dst)
+        # TODO: Generic
+        out = ApsimXFile.from_crop_name(
+            args.crop_name,
+            dst=args.dst,
+            from_example=args.from_example,
+            interactive=args.interactive,
+            actions=args.actions,
+            model_dir=args.apsimx_dir
+        )
+        out.write(overwrite=args.overwrite)
+        out.generated = False  # Prevent cleanup
+        print(f"Created input file \"{out.fname}\"")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from fastapi import HTTPException
 from apsimx_gym.engine import ApsimXEngine
 _actions = list(ApsimXEngine.AVAILABLE_ACTION_MAP.keys())
+_actions_default = [x for x in _actions if x not in ["sow", "harvest"]]
 
 
 class Settings(BaseSettings):
@@ -96,33 +97,40 @@ class InteractiveModelRegistry:
 
 # Request payload for API, declared with Pydantic
 class ModelInput(BaseModel):
-    crop_name: str = Field(description="that will be simulated")
+    crop_name: str = Field(
+        description="that will be simulated",
+        example="Wheat")
     crop_variety: str | None = Field(
-        None, description="that will be simulated")
+        None, example="Herzog",
+        description="that will be simulated")
     latitude: float | None = Field(
-        None, description="used to get weather data (degrees)")
+        40.1164,
+        description="used to get weather data (degrees)")
     longitude: float | None = Field(
-        None, description="used to get weather data (degrees)")
+        -88.2434,
+        description="used to get weather data (degrees)")
     year: int | None = Field(
-        None, description=(
+        None, example=1991,
+        description=(
             "used to get weather data. Overrides the year in the "
             "default/provided start_time, end_time, sow_date, and/or "
             "harvest_date"
         ))
     start_time: datetime.datetime | None = Field(
-        None, description="of simulation (ISO 8601 format)")
+        None, example=datetime.datetime.fromisoformat("1991-01-01"),
+        description="of simulation (ISO 8601 format)")
     end_time: datetime.datetime | None = Field(
-        None, description="of simulation (ISO 8601 format)")
+        None, example=datetime.datetime.fromisoformat("1991-11-05"),
+        description="of simulation (ISO 8601 format)")
     sow_date: datetime.datetime | None = Field(
-        None, description="for the simulated crop (ISO 8601 format)"
-    )
+        None, example=datetime.datetime.fromisoformat("1991-01-01"),
+        description="for the simulated crop (ISO 8601 format)")
     harvest_date: datetime.datetime | None = Field(
-        None, description="for the simulated crop (ISO 8601 format)"
-    )
+        None, example=datetime.datetime.fromisoformat("1991-11-05"),
+        description="for the simulated crop (ISO 8601 format)")
     timestep: int | datetime.timedelta | None = Field(
-        None, description=(
-            "between records of state variables (days)"
-        ))
+        None, example=10,
+        description="between records of state variables (days)")
     state_variables: List[str] = Field(
         ["[Clock].Today", "[Wheat].Grain.Total.Wt"], description=(
             "that should be recorded at each reported time step "
@@ -199,10 +207,10 @@ class ModelInput(BaseModel):
         idata = None
         if self.state_variables:
             idata = self._model.getvars(self.state_variables)
-        if self.timestep is None:
-            self._model.resume(wait=wait)
-        else:
+        if self.timestep:
             self._model.fast_forward(self.timestep)
+        else:
+            self._model.resume(wait=wait)
         if self.state_variables:
             if self._trace is None:
                 self._trace = {k: [v] for k, v in idata.items()}
@@ -256,11 +264,11 @@ class ModelInput(BaseModel):
 
 class InteractiveModelInput(ModelInput):
     actions: List[str] = Field(
-        _actions, description=(
+        _actions_default, description=(
             "to make available at each timestep "
         ), json_schema_extra={
             "items": {
-                "type": "str",
+                "type": "string",
                 "enum": _actions,
             },
         }
@@ -323,6 +331,7 @@ class InteractiveModelInput(ModelInput):
 class ModelSetInput(BaseModel):
 
     values: dict = Field(
+        example={"[Grain].MaximumPotentialGrainSize.FixedValue": 0.043},
         description=(
             "mapping between state variable names and values they "
             "should be set to (json object)"
@@ -339,6 +348,7 @@ class ModelSetInput(BaseModel):
 class ModelGetInput(BaseModel):
 
     state_variables: List[str] = Field(
+        example=["[Clock].Today", "[Wheat].Grain.Total.Wt"],
         description="to get values for (comma separated list)"
     )
 
@@ -352,13 +362,13 @@ class ModelGetInput(BaseModel):
 
 class ModelActionInput(BaseModel):
 
-    # TODO: Get values
     action: str = Field(
+        example="nitrogen",
         description="to perform",
         json_schema_extra={"enum": _actions},
     )
     parameters: dict = Field(
-        {},
+        {}, example={"amount", 160.0},
         description="describing the management action (json object)"
     )
 

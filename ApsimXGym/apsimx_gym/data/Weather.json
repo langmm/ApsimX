@@ -1,0 +1,11 @@
+{
+    "$type": "Models.Climate.Weather, Models",
+    "ConstantsFile": null,
+    "FileName": "%root%/Examples/WeatherFiles/AU_Dalby.met",
+    "ExcelWorkSheetName": "",
+    "Name": "Weather",
+    "ResourceName": null,
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false
+}

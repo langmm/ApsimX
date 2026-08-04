@@ -64,11 +64,8 @@ def address(local_address, request, ping_address):
     if request.param == "local":
         out = local_address
     else:
-        out = (
-            "https://66202345-1ca8-4b56-9fb7-abb6e439a4db-8000"
-            ".app.beam.cloud"
-        )
-    if not ping_address(out):
+        out = os.environ.get("APSIMX_REMOTE_ADDRESS", None)
+    if not (out and ping_address(out)):
         pytest.skip(f"Could not connect to \"{out}\"")
     yield out
 
@@ -98,11 +95,18 @@ def running_interactive_model(address):
 def base_model_request():
     return {
         "crop_name": "Wheat",
+        # TODO: Default lat/lon of Champaign in updated version
+        # (this can be removed after reployment)
+        "latitude": 40.1164,
+        "longitude": -88.2434,
     }
 
 
 def test_model(address, base_model_request):
-    expected = pytest.approx(309.2315738609009, rel=1e-3)
+    # This value for lon/lat of Champaign
+    expected = pytest.approx(402.63773381981514, rel=1e-3)
+    # This value for the lon/lat in the Wheat example
+    # expected = pytest.approx(309.2315738609009, rel=1e-3)
     r = requests.post(f'{address}/start', json=base_model_request)
     r.raise_for_status()
     response = r.json()

@@ -10,6 +10,7 @@ _gymdir = os.path.dirname(__file__)
 _apsimxdir = os.path.dirname(os.path.dirname(_gymdir))
 if os.path.basename(_apsimxdir) != 'ApsimX':
     _apsimxdir = None
+_datadir = os.path.join(_gymdir, "data")
 
 
 class LogPipe(threading.Thread):

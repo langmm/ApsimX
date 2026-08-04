@@ -1636,7 +1636,7 @@ class BaseModelEngine(ABC):
 
     def __init__(
             self,
-            model_file: Union[str, List[str]],
+            model_file: Union[str, List[str], BaseModelFile],
             model_dir: Optional[str] = None,
             model_suffix: Optional[str] = None,
             output_dir: Optional[str] = None,
@@ -1661,14 +1661,18 @@ class BaseModelEngine(ABC):
         self.initial_param_dynamic = {}
         self.initial_param_src = {}
         self.history = defaultdict(lambda: [])
-        if ((self.model_file and self.model_dir
-             and (not os.path.isfile(self.model_file))
-             and (not os.path.isabs(self.model_file))
-             and os.path.isfile(
-                 os.path.join(self.model_dir, self.model_file)))):
-            self.model_file = os.path.join(
-                self.model_dir, self.model_file)
-        self.model = self.INPUT_FILE_TYPE(self.model_file)
+        if isinstance(self.model_file, BaseModelFile):
+            self.model = self.model_file
+            self.model_file = self.model.fname
+        else:
+            if ((self.model_file and self.model_dir
+                 and (not os.path.isfile(self.model_file))
+                 and (not os.path.isabs(self.model_file))
+                 and os.path.isfile(
+                     os.path.join(self.model_dir, self.model_file)))):
+                self.model_file = os.path.join(
+                    self.model_dir, self.model_file)
+            self.model = self.INPUT_FILE_TYPE(self.model_file)
         self.action_map = ModelActionSet.create(
             action_map or self.select_actions(actions),
         )

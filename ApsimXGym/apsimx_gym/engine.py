@@ -1,17 +1,20 @@
 import os
 import re
+import glob
 import json
 import copy
+import time
 import zmq
 import msgpack
 import subprocess
 import contextlib
 import datetime
+from functools import cached_property
 import numpy as np
 import pandas as pd
 from typing import Optional, Union, Any, List, Callable
 from . import logger
-from .utils import _gymdir, _apsimxdir, LogPipe
+from .utils import _gymdir, _apsimxdir, _datadir, LogPipe
 from .base import (
     readonly_cached_property,
     RecoverableError, ModelEngineError, InvalidActionError,
@@ -23,7 +26,6 @@ from .crop import (
 )
 
 
-_datadir = os.path.join(_gymdir, "data")
 _syncfile = os.path.join(_datadir, "Synchroniser.json")
 
 
@@ -212,6 +214,417 @@ class ApsimXWeatherFile(BaseWeatherFile):
         pass
 
 
+class ApsimXFileNode:
+    r"""Container for node in ApsimXFile.
+
+    Args:
+        contents: Contents of the node.
+        parent: Parent node.
+        **kwargs: Additional keywords are added directly to the node.
+
+    """
+
+    def __init__(self, contents: dict,
+                 parent: Optional["ApsimXFileNode" | None] = None,
+                 **kwargs):
+        self.contents = contents
+        self.contents.update(**kwargs)
+        self.parent = parent
+        if "Children" in self.contents:
+            for i, x in enumerate(self.contents["Children"]):
+                if isinstance(x, ApsimXFileNode):
+                    self.contents["Children"][i] = x.contents
+
+    @classmethod
+    def from_param(cls, node_type: str, **kwargs) -> "ApsimXFileNode":
+        r"""Create a new node from the provided parameters.
+
+        Args:
+            node_type: Node type.
+            **kwargs: Additional keyword arguments are passed to the
+                class constructor.
+
+        Returns:
+            ApsimXFileNode: New node.
+
+        """
+        contents = {
+            "$type": node_type,
+            "Name": kwargs.pop(
+                "Name",
+                node_type.split(",", 1)[0].rsplit(".", 1)[-1].strip()
+            ),
+            "ResourceName": None,
+            "Children": [],
+            "Enabled": True,
+            "ReadOnly": False,
+        }
+        return cls(contents, **kwargs)
+
+    @classmethod
+    def from_file(cls, fname: str, **kwargs):
+        r"""Create a new node by loading code from the provided JSON
+        file.
+
+        Args:
+            fname: Full path to file.
+            **kwargs: Additional keyword arguments are passed to the
+                class constructor.
+
+        Returns:
+            ApsimXFileNode: New node.
+
+        """
+        with open(fname, 'r') as fd:
+            contents = json.load(fd)
+        return cls(contents, **kwargs)
+
+    @classmethod
+    def from_data(cls, name: str, **kwargs):
+        r"""Create a new node by loading code from a data file.
+
+        Args:
+            name: Name of the data file resource.
+            **kwargs: Additional keyword arguments are passed to the
+                class constructor.
+
+        Returns:
+            ApsimXFileNode: New node.
+
+        """
+        fname = os.path.join(_datadir, f"{name}.json")
+        return cls.from_file(fname, **kwargs)
+
+    def __str__(self):
+        return f"ApsimXFileNode({self.absolute_path})"
+
+    # @cached_property
+    # def state_variables(self) -> List[str]:
+    #     r"""list: State variable names."""
+    #     _regex_model = r'^\[(?P<model>\w+)\].*'
+    #     out = []
+    #     for x in self.children:
+    #         for sv in x.state_variables:
+    #             if sv.startswith("["):
+    #                 out.append(sv)
+    #             else:
+    #                 out.append(
+    #         out += x.state_variables
+    #     return out
+
+    @cached_property
+    def root(self) -> "ApsimXFileNode":
+        r"""Root node"""
+        if self.parent is None:
+            return self
+        return self.parent.root
+
+    @cached_property
+    def absolute_path(self) -> str:
+        r"""str: Absolute path to the node from the root node."""
+        if self.parent is None:
+            return "[" + self["Name"] + "]"
+        return self.parent.absolute_path + "." + self["Name"]
+
+    @property
+    def children(self) -> List["ApsimXFileNode"]:
+        r"""list: Child nodes."""
+        for x in self.contents.get("Children", []):
+            yield ApsimXFileNode(x, parent=self)
+
+    def __contains__(self, name):
+        return name in self.contents
+
+    def __getitem__(self, name):
+        return self.contents[name]
+
+    def __setitem__(self, name, value):
+        self.contents[name] = value
+
+    def __delitem__(self, name):
+        del self.contents[name]
+
+    def get(self, name: str, default: Any):
+        return self.contents.get(name, default)
+
+    def keys(self):
+        r"""Get the keys in the node."""
+        for x in self.contents.keys():
+            yield x
+
+    def values(self):
+        r"""Get the values in the node."""
+        for x in self.contents.values():
+            yield x
+
+    def items(self):
+        r"""Get the items in the node."""
+        for x in self.contents.items():
+            yield x
+
+    def specialize_crop(self, crop_name: str):
+        r"""Specialize the crop referenced by the node.
+
+        Args:
+            crop_name: Name of crop to specialize.
+
+        """
+        if self.has_parameter("Crop"):
+            if "CROP" in self["Name"]:
+                prev = "CROP"
+            else:
+                prev = self.get_parameter("Crop")
+            self["Name"] = self["Name"].replace(prev, crop_name)
+            self.set_parameter("Crop", crop_name)
+        for x in self.children:
+            x.specialize_crop(crop_name)
+
+    def has_parameter(self, name: str | set) -> bool:
+        r"""Check if the node has a parameter of a given name.
+
+        Args:
+            name: Parameter name.
+
+        Returns:
+            bool: True if the parameter is present, False otherwise.
+
+        """
+        if "Parameters" not in self:
+            return False
+        for x in self["Parameters"]:
+            if isinstance(name, set) and x["Key"] in name:
+                return True
+            elif x["Key"] == name:
+                return True
+        return False
+
+    def get_parameter(self, name: str) -> Any:
+        r"""Get a node parameter value.
+
+        Args:
+            name: Parameter name.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+
+        """
+        if "Parameters" not in self:
+            raise KeyError(f"No parameters in {self}")
+        for x in self["Parameters"]:
+            if isinstance(name, set) and x["Key"] in name:
+                return x["Value"]
+            elif x["Key"] == name:
+                return x["Value"]
+        raise KeyError(f"No parameter named \"{name}\" in {self}")
+
+    def set_parameter(self, name: str, value: Any):
+        r"""Set a node parameter.
+
+        Args:
+            name: Parameter name.
+            value: Parameter value.
+
+        Raises:
+            KeyError: If name is not a valid parameter name.
+
+        """
+        if "Parameters" not in self:
+            raise KeyError(f"No parameters in {self}")
+        for x in self["Parameters"]:
+            if isinstance(name, set) and x["Key"] in name:
+                x["Value"] = value
+                return
+            elif x["Key"] == name:
+                x["Value"] = value
+                return
+        raise KeyError(f"No parameter named \"{name}\" in {self}")
+
+    def findall(self, name: Optional[str] = None,
+                requirements: Optional[dict] = None):
+        r"""Find a node in the file.
+
+        Args:
+            name: Name of the node to find.
+            requirements: Set of requirements that the node must
+                satisfy (see node_matches for a description of the
+                available options).
+
+        Yields:
+            ApsimXFileNode: All nodes matching the specified name.
+
+        """
+        requirements = requirements or {}
+        assert name is not None or requirements
+        if self.matches(name=name, **requirements):
+            yield self
+        for x in self.children:
+            for out in x.findall(name=name, requirements=requirements):
+                yield out
+
+    def find(self, name: Optional[str] = None,
+             required: Optional[bool] = False,
+             requirements: Optional[dict] = None) -> "ApsimXFileNode":
+        r"""Find a node in the file.
+
+        Args:
+            name: Name of the node to find.
+            required: If True, an error will be raised if the node
+                cannot be located.
+            requirements: Set of requirements that the node must
+                satisfy (see node_matches for a description of the
+                available options).
+
+        Returns:
+            ApsimXFileNode: The node matching the specified name.
+                Empty if no node can be found.
+
+        Raises:
+            KeyError: If required is True and the node cannot be located.
+
+        """
+        requirements = requirements or {}
+        assert name is not None or requirements
+        if self.matches(name=name, **requirements):
+            return self
+        for x in self.children:
+            out = x.find(name=name, requirements=requirements)
+            if out.contents:
+                return out
+        if required:
+            msg = ""
+            if name is not None:
+                msg += f" with \"Name\" {name}"
+            if requirements:
+                msg += f" matching requirements {requirements}"
+            raise KeyError(f"Could not locate a node{msg}")
+        return ApsimXFileNode({})
+
+    def matches(self,
+                errors: Optional[list] = None,
+                name: Optional[str] = None,
+                field: Optional[str] = None,
+                parameter: Optional[str] = None,
+                internal: Optional[str] = None,
+                contains: Optional[Union[list, set, dict]] = None,
+                equals: Optional[Any] = None,
+                fvalid: Optional[Callable] = None,
+                calls: Optional[str] = None,
+                anyOf: Optional[list] = None,
+                nested: Optional[dict] = None,
+                **kwargs) -> bool:
+        r"""Check if a node matches the specified requirements.
+
+        Args:
+            errors: If a list is provided, errors will be added to this
+                list.
+            name: Name that the node must have.
+            field: Name of a field that must be present.
+            parameter: Name of a parameter that must be present.
+            contains: Fields/elements that the node must contain. If a
+                set is provided, only one of the elements must be
+                present. If a dict is provided, the values in the node
+                must match the values in the provided dict.
+            equals: Value that the node must be equivalent to.
+            fvalid: Function that returns True if the node is valid, and
+                False otherwise.
+            calls: Name of a function called in the node code block.
+            anyOf: List of kwargs for node_matches that should be
+                checked. If the node satisfies any of these requirements,
+                True will be returned.
+            nested: Set of requirements for individual fields.
+            **kwargs: Additional keyword arguments are ignored.
+
+        Returns:
+            bool: True if the node matches, False otherwise.
+
+        """
+
+        def add_error(msg):
+            if not isinstance(errors, list):
+                return False
+            errors.append(msg)
+            return True
+
+        if anyOf:
+            if isinstance(errors, list):
+                xerrors = []
+                if not any(self.matches(errors=xerrors, **x)
+                           for x in anyOf):
+                    errors += xerrors
+            else:
+                if not any(self.matches(**x) for x in anyOf):
+                    return False
+        if name is not None and self.get("Name", None) != name:
+            if not add_error(f"{self} name is not {name}"):
+                return False
+        if field is not None and field not in self:
+            if not add_error(f"{self} is missing field \"{field}\""):
+                return False
+        if ((parameter is not None
+             and not self.has_parameter(parameter))):
+            if not add_error(f"{self} is missing parameter \"{parameter}\""):
+                return False
+        if internal:
+            if not self.matches(**ApsimXFile.PARAM_NODES[internal]):
+                return False
+        if contains:
+            if isinstance(contains, str):
+                contains = [contains]
+            if isinstance(contains, set):
+                missing = (
+                    list(contains)
+                    if not any(k in self for k in contains)
+                    else []
+                )
+            elif isinstance(contains, dict):
+                missing = [k for k in contains.keys() if k not in self]
+            else:
+                assert isinstance(contains, list)
+                missing = [k for k in contains if k not in self]
+            if missing and not add_error(f"Missing {missing}"):
+                return False
+            if isinstance(contains, dict):
+                for k, v in contains.items():
+                    if k not in self:
+                        continue
+                    if self[k] != v and not add_error(
+                            f"{k}: {self[k]} != {v}"):
+                        return False
+        if equals and self.contents != equals:
+            if not add_error(f"{self.contents} != {equals}"):
+                return False
+        if fvalid and not fvalid(self.contents):
+            if not add_error(f"{self} fails function {fvalid}"):
+                return False
+        if ((calls and not (
+                isinstance(self.contents, dict)
+                and any(f"{calls}(" in x
+                        for x in self.get("CodeArray", []))))):
+            if not add_error(f"{self} does not call \"{calls}\""):
+                return False
+        if nested:
+            missing = [k for k in nested.keys() if k not in self]
+            if missing and not add_error(f"Missing {missing}"):
+                return False
+            for k, v in nested.items():
+                if k not in self:
+                    continue
+                knode = ApsimXFileNode(self[k])
+                if isinstance(errors, list):
+                    verrors = []
+                    knode.matches(errors=verrors, **v)
+                    errors += [f"{k}: {x}" for x in verrors]
+                elif not knode.matches(**v):
+                    return False
+        if errors:
+            return False
+        return True
+
+
 class ApsimXFile(CropModelFile):
     r"""Container for manipulating .apsimx model files.
 
@@ -252,7 +665,7 @@ class ApsimXFile(CropModelFile):
                 "Enabled": True,
                 "ReadOnly": False,
             },
-        }
+        },
     }, ** {
         k: {
             "parent": {"contains": {"Name": "Field"}},
@@ -404,10 +817,97 @@ class ApsimXFile(CropModelFile):
         r"""dict: Previously loaded parameter nodes."""
         return {}
 
+    # TODO: Set default from_example to False after it is debugged
     @classmethod
     def crop2fname(cls, crop_name: str,
-                   model_dir: Optional[str] = None) -> str:
+                   model_dir: Optional[str] = None,
+                   from_example: bool | str = True) -> str:
         r"""Locate an input model file for a given crop name.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+            from_example: If True, create the file from an example.
+
+        Returns:
+            str: Model input file for the specified crop.
+
+        """
+        node = cls.from_crop_name(crop_name, model_dir=model_dir,
+                                  from_example=from_example)
+        node.write()
+        return node
+
+    @classmethod
+    def available_crops(cls, model_dir: Optional[str] = None) -> List[str]:
+        r"""Get the crops that can be simulated via this model.
+
+        Args:
+            model_dir: Directory containing the model.
+
+        Returns:
+            list: Available crop names.
+
+        """
+        if model_dir is None:
+            model_dir = _apsimxdir
+        resources_dir = os.path.join(model_dir, "Models", "Resources")
+        files = glob.glob(os.path.join(resources_dir, "*.json"))
+        exclude = [
+            "CLEM",
+            "MicroClimate",
+            "Nutrient",
+            "SCRUM",
+            "Slurp",
+            "SPRUM",
+            "STRUM",
+            "SurfaceOrganicMatter",
+            "WaterBalance",
+            # Non-PMF (TODO: Exclude by parsing)
+            "Sugarcane",
+        ]
+        out = []
+        for x in files:
+            name = os.path.splitext(os.path.basename(x))[0]
+            if name in exclude or name.startswith("AGP"):
+                continue
+            out.append(name)
+        return out
+
+    @classmethod
+    def available_cultivars(cls, crop_name: str,
+                            model_dir: Optional[str] = None) -> List[str]:
+        r"""Get the cultivars for a given crop that can be simulated
+        via this model.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+
+        Returns:
+            list: Available crop cultivar names.
+
+        """
+        if model_dir is None:
+            model_dir = _apsimxdir
+        crop_name = cls.validate_crop_name(
+            crop_name, model_dir=model_dir)
+        resources_file = ApsimXFileNode.from_file(
+            os.path.join(
+                model_dir, "Models", "Resources", f"{crop_name}.json"))
+        out = []
+        for x in resources_file.findall(
+                requirements={
+                    "contains": {
+                        "$type": "Models.PMF.Cultivar, Models"}
+                }):
+            out.append(x["Name"])
+        return out
+
+    @classmethod
+    def find_example(cls, crop_name: str,
+                     model_dir: Optional[str] = None) -> str:
+        r"""Locate an example model file for a given crop name.
 
         Args:
             crop_name: Crop name.
@@ -427,11 +927,183 @@ class ApsimXFile(CropModelFile):
         raise ValueError(f"Could not locate a model file for crop "
                          f"\"{crop_name}\".")
 
+    @classmethod
+    def from_example(cls, src: str | "ApsimXFile",
+                     dst: str | None = None,
+                     interactive: bool = False,
+                     actions: List[str] | None = None) -> CropModelFile:
+        r"""Create an input model file from an example.
+
+        Args:
+            src (str, ApsimXFile): Path to the source .apsimx model.
+            dst (str, optional): Path to the location where the generated
+                .apsimx model should be saved.
+            interactive: If True, make the file interactive.
+            actions: Interactive actions that should be added.
+
+        Returns:
+            CropModelFile: Constructed model input file.
+
+        """
+        if not isinstance(src, ApsimXFile):
+            src = ApsimXFile(src)
+        out = src.copy(dst=dst)
+        if interactive or actions:
+            if not actions:
+                actions = list(ApsimXEngine.AVAILABLE_ACTION_MAP.keys())
+            out.make_interactive(actions)
+        return out
+
+    @classmethod
+    def from_crop_name(cls, crop_name: str, dst: str | None = None,
+                       from_example: bool | str = False,
+                       interactive: bool = False,
+                       actions: List[str] | None = None,
+                       model_dir: Optional[str] = None) -> CropModelFile:
+        r"""Create an input model file for a given crop name.
+
+        Args:
+            crop_name: Crop name.
+            dst (str, optional): Path to the location where the generated
+                .apsimx model should be saved.
+            from_example: If True, create the file from an example.
+            interactive: If True, make the file interactive.
+            actions: Interactive actions that should be added.
+            model_dir: Directory containing the model.
+
+        Returns:
+            CropModelFile: Constructed model input file.
+
+        """
+        if from_example:
+            if isinstance(from_example, str):
+                src = from_example
+            else:
+                src = cls.find_example(crop_name, model_dir=model_dir)
+            return cls.from_example(src, dst=dst,
+                                    interactive=interactive,
+                                    actions=actions)
+        crop_name = cls.validate_crop_name(
+            crop_name, model_dir=model_dir)
+        if dst is None:
+            if interactive or actions:
+                dst = f"{crop_name}-Generated-Interactive.apsimx"
+            else:
+                dst = f"{crop_name}-Generated.apsimx"
+        if actions is None:
+            if interactive:
+                actions = list(ApsimXEngine.AVAILABLE_ACTION_MAP.keys())
+            else:
+                actions = []
+        sim_children = [
+            ApsimXFileNode.from_data("Clock"),
+            ApsimXFileNode.from_data("Summary"),
+            ApsimXFileNode.from_data("Weather"),
+            ApsimXFileNode.from_param(
+                "Models.Soils.Arbitrator.SoilArbitrator, Models"),
+            ApsimXFileNode.from_data("MicroClimate"),
+        ]
+        zone_children = [
+            ApsimXFileNode.from_param(
+                "Models.Report, Models",
+                VariableNames=[
+                    "[Clock].Today",
+                    f"[{crop_name}].LAI",
+                    f"[{crop_name}].Phenology.Zadok.Stage",
+                    f"[{crop_name}].Phenology.CurrentStageName",
+                    f"[{crop_name}].AboveGround.Wt",
+                    f"[{crop_name}].AboveGround.N",
+                    f"[{crop_name}].Grain.Total.Wt*10 as Yield",
+                    f"[{crop_name}].Grain.Protein",
+                    f"[{crop_name}].Grain.Size",
+                    f"[{crop_name}].Grain.Number",
+                    f"[{crop_name}].Grain.Total.Wt",
+                    f"[{crop_name}].Grain.Total.N",
+                    f"[{crop_name}].Total.Wt"
+                ],
+                EventNames=[
+                    # TODO: Daily?
+                    # "[Clock].DoReport",
+                    f"[{crop_name}].Harvesting",
+                ],
+                GroupByVariableName=None,
+            ),
+            ApsimXFileNode.from_param(
+                "Models.Fertiliser, Models",
+                ResourceName="Fertiliser",
+            ),
+            ApsimXFileNode.from_param(
+                "Models.Irrigation, Models",
+                # ResourceName="Irrigation",
+            ),
+            # SOIL:
+            # "Models.Soils.Soil, Models"
+            #    "Models.Soils.Physical, Models"
+            #       "Models.Soils.SoilCrop, Models"
+            #    "Models.WaterModel.WaterBalance, Models"
+            #    "Models.Soils.Organic, Models"
+            #    "Models.Soils.Chemical, Models"
+            #    "Models.Soils.Water, Models"
+            #    "Models.Soils.CERESSoilTemperature, Models"
+            #    "Models.Soils.Nutrients.Nutrient, Models"
+            #    "Models.Soils.Solute, Models" -> NO3, NH4, Urea
+            # "Models.Surface.SurfaceOrganicMatter, Models"
+            ApsimXFileNode.from_param(
+                "Models.PMF.Plant, Models",
+                Name=crop_name,
+                ResourceName=crop_name,
+            ),
+            ApsimXFileNode.from_data(
+                "AutoSow",  # TODO: Handle cultivar
+                Enabled=("sow" not in actions),
+            ),
+            # Fertilise @ sow?
+            # Scheduled fertilizer/irrigation
+            # (see Operations in Examples/Potato.apsimx)
+            ApsimXFileNode.from_data(
+                "AutoHarvest",
+                Enabled=("harvest" not in actions),
+            ),
+        ]
+        sim_children.append(
+            ApsimXFileNode.from_param(
+                "Models.Core.Zone, Models",
+                Area=1.0,
+                Slop=0.0,
+                AspectAngle=0.0,
+                Altitude=50.0,
+                Name="Field",
+                Children=zone_children,
+            )
+        )
+        contents = ApsimXFileNode.from_param(
+            "Models.Core.Simulations, Models",
+            Version=168,
+            Children=[
+                ApsimXFileNode.from_param(
+                    "Models.Core.Simulation, Models",
+                    Descriptors=None,
+                    Children=sim_children,
+                ),
+                ApsimXFileNode.from_param(
+                    "Models.Storage.DataStore, Models",
+                    useFirebird=False,
+                    CustomFileName=None,
+                ),
+            ]
+        )
+        contents.specialize_crop(crop_name)
+        assert contents["Name"] == "Simulations"
+        out = cls(dst, generated=True, contents=contents.contents)
+        if interactive or actions:
+            out.make_interactive(actions)
+        return out
+
     @property
     def formal_crop_name(self) -> str:
         r"""str: Crop name used for resources."""
-        # TODO: Lookup resource?
-        return self.crop_name.title()
+        # return self.crop_name.title()
+        return self.validate_crop_name(self.crop_name)
 
     def _get_external_name(self, name: str) -> str:
         r"""Get the external variable name from the internal variable
@@ -671,6 +1343,8 @@ class ApsimXFile(CropModelFile):
             contents: File contents to write.
 
         """
+        if isinstance(contents, ApsimXFileNode):
+            contents = contents.contents
         with open(fname, "w") as fd:
             json.dump(contents, fd, indent="    ")
 
@@ -1054,15 +1728,14 @@ class ApsimXFile(CropModelFile):
 
     def findall(self, name: Optional[str] = None,
                 current: Optional[dict] = None,
-                parent: Optional[Union[bool, dict]] = False,
+                parent: Optional[bool] = False,
                 requirements: Optional[dict] = None) -> list:
         r"""Find a node in the file.
 
         Args:
             name: Name of the node to find.
             current: The current node being searched.
-            parent: The parent node. If True, the parent node will be
-                returned.
+            parent: If True, the parent node will be returned.
             requirements: Set of requirements that the node must
                 satisfy (see node_matches for a description of the
                 available options).
@@ -1071,23 +1744,19 @@ class ApsimXFile(CropModelFile):
             dict: All nodes matching the specified name.
 
         """
-        requirements = requirements or {}
-        assert name is not None or requirements
+        assert not isinstance(parent, dict)
         if current is None:
             current = self.contents
-        if self.node_matches(current, name=name, **requirements):
-            yield parent if parent else current
-        for x in current.get("Children", []):
-            for out in self.findall(
-                    name=name, current=x,
-                    parent=(current if parent else False),
-                    requirements=requirements
-            ):
-                yield out
+        for node in ApsimXFileNode(current).findall(
+                name=name, requirements=requirements):
+            if parent:
+                yield node.parent.contents
+            else:
+                yield node.contents
 
     def find(self, name: Optional[str] = None,
              current: Optional[dict] = None,
-             parent: Optional[Union[bool, dict]] = False,
+             parent: Optional[bool] = False,
              required: Optional[bool] = False,
              requirements: Optional[dict] = None) -> dict:
         r"""Find a node in the file.
@@ -1095,8 +1764,7 @@ class ApsimXFile(CropModelFile):
         Args:
             name: Name of the node to find.
             current: The current node being searched.
-            parent: The parent node. If True, the parent node will be
-                returned.
+            parent: If True, the parent node will be returned.
             required: If True, an error will be raised if the node
                 cannot be located.
             requirements: Set of requirements that the node must
@@ -1111,27 +1779,15 @@ class ApsimXFile(CropModelFile):
             KeyError: If required is True and the node cannot be located.
 
         """
-        requirements = requirements or {}
-        assert name is not None or requirements
+        assert not isinstance(parent, dict)
         if current is None:
             current = self.contents
-        if self.node_matches(current, name=name, **requirements):
-            out = parent if parent else current
-            return out
-        for x in current.get("Children", []):
-            out = self.find(name=name, current=x,
-                            parent=(current if parent else False),
-                            requirements=requirements)
-            if out:
-                return out
-        if required:
-            msg = ""
-            if name is not None:
-                msg += f" with \"Name\" {name}"
-            if requirements:
-                msg += f" matching requirements {requirements}"
-            raise KeyError(f"Could not locate a node{msg}")
-        return {}
+        node = ApsimXFileNode(current).find(
+            name=name, required=required,
+            requirements=requirements)
+        if parent and node.parent:
+            node = node.parent
+        return node.contents
 
     def _make_interactive(self, actions: list):
         r"""Modify this file to make it interactive.
@@ -1443,9 +2099,21 @@ class ApsimXEngine(CropModelEngine):
         self.stderr_pipe = LogPipe(
             self.process.stderr, prefix="APSIMX", level="ERROR")
         logger.info(f"Started APSIMX process id: {self.process.pid}")
-        assert self.status == "connect"
-        if self.status != "paused":
+        tstart = time.time()
+        while time.time() - tstart < 5 and self.is_running:
+            try:
+                self._status = self.socket.recv_string(
+                    flags=zmq.NOBLOCK)
+                break
+            except zmq.ZMQError as e:
+                if e.errno != zmq.EAGAIN:
+                    raise
+        if self._status != "connect":
             self.stop(cleanup=True)
+            raise ModelEngineError("Failed to connect with the "
+                                   "ApsimX ZMQ server")
+        self.send_command("ok")
+        if self.status != "paused":
             raise AssertionError(f"Server is not awaiting instructions: "
                                  f"status = \"{self.status}\"")
         if self.start_time is None:

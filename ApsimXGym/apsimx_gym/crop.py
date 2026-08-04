@@ -33,6 +33,75 @@ class CropModelFile(BaseModelFile):
         """
         raise NotImplementedError  # pragma: no cover
 
+    @classmethod
+    @abstractmethod
+    def available_crops(cls, model_dir: Optional[str] = None) -> List[str]:
+        r"""Get the crops that can be simulated via this model.
+
+        Args:
+            model_dir: Directory containing the model.
+
+        Returns:
+            list: Available crop names.
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
+    @classmethod
+    @abstractmethod
+    def available_cultivars(cls, crop_name: str,
+                            model_dir: Optional[str] = None) -> List[str]:
+        r"""Get the cultivars for a given crop that can be simulated
+        via this model.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+
+        Returns:
+            list: Available crop cultivar names.
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
+    @classmethod
+    def validate_crop_name(cls, crop_name: str,
+                           model_dir: Optional[str] = None) -> str:
+        r"""Ensure the crop name is one of those that can be simulated,
+        normalizing it if necessary.
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory containing the model.
+
+        Returns:
+            str: Normalized crop name.
+
+        """
+        available_crops = cls.available_crops(model_dir=model_dir)
+        for alias in [crop_name, crop_name.lower(), crop_name.title()]:
+            if alias in available_crops:
+                return alias
+        raise NotImplementedError(
+            f"Invalid crop name \"{crop_name}\". "
+            f"Valid crop names are:\n\t"
+            + "\n\t".join(available_crops))
+
+    @classmethod
+    @abstractmethod
+    def from_crop_name(cls, crop_name: str,
+                       model_dir: Optional[str] = None) -> "CropModelFile":
+        r"""Create an input model file for a given crop name.
+
+        Args:
+            crop_name: Crop name.
+            model_dir: Directory where the generated model should be saved.
+
+        Returns:
+            CropModelFile: Constructed model input file.
+
+        """
+        raise NotImplementedError  # pragma: no cover
+
     @BaseModelFile.parameter_property
     def crop_name(self):
         r"""str: Crop name."""
@@ -495,7 +564,8 @@ class CropModelEngine(BaseModelEngine):
 
     def __init__(
             self,
-            model_file: Optional[Union[str, List[str]]] = None,
+            model_file: Optional[Union[str, List[str],
+                                       BaseModelFile]] = None,
             crop_name: Optional[str] = None,
             crop_variety: Optional[str] = None,
             sow_date: Optional[datetime.date] = None,

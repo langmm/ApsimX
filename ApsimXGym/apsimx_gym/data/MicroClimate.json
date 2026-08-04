@@ -1,0 +1,16 @@
+{
+    "$type": "Models.MicroClimate, Models",
+    "a_interception": 0.0,
+    "b_interception": 1.0,
+    "c_interception": 0.0,
+    "d_interception": 0.0,
+    "SoilHeatFluxFraction": 0.4,
+    "MinimumHeightDiffForNewLayer": 0.0,
+    "NightInterceptionFraction": 0.5,
+    "ReferenceHeight": 2.0,
+    "Name": "MicroClimate",
+    "ResourceName": null,
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false
+}

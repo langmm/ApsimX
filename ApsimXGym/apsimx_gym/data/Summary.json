@@ -1,0 +1,9 @@
+{
+    "$type": "Models.Summary, Models",
+    "Verbosity": 100,
+    "Name": "Summary",
+    "ResourceName": null,
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false
+}

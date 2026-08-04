@@ -8,8 +8,18 @@ from apsimx_gym.base import (
     InvalidActionError, RecoverableError,
     RecoverableModelEngineError,
 )
-from apsimx_gym.engine import ApsimXEngine, ApsimXEnv
+from apsimx_gym.engine import ApsimXFile, ApsimXEngine, ApsimXEnv
 logger.setLevel(logging.INFO)
+
+
+class TestApsimXFile:
+
+    def test_available_crops(self, apsimx_dir):
+        assert ApsimXFile.available_crops(model_dir=apsimx_dir)
+
+    def test_available_cultivars(self, apsimx_dir):
+        assert ApsimXFile.available_cultivars(
+            "wheat", model_dir=apsimx_dir)
 
 
 class TestApsimXEngine:
