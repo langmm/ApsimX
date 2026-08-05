@@ -1,7 +1,7 @@
 import os
 import threading
 import logging
-from typing import Optional, Union
+from typing import Optional, Union, Any
 from io import BufferedReader
 from . import logger
 
@@ -29,7 +29,20 @@ class LogPipe(threading.Thread):
     def __init__(self, pipe: BufferedReader,
                  level: Optional[Union[str, int]] = "INFO",
                  prefix: Optional[str] = "",
-                 daemon: Optional[bool] = True, **kwargs):
+                 daemon: Optional[bool] = True,
+                 **kwargs: Any) -> None:
+        r"""Initialize the LogPipe thread.
+
+        Args:
+            pipe: Pipe that output should be streamed from.
+            level: Integer logging level or the name of the logging
+                level.
+            prefix: Prefix to add to log messages.
+            daemon: True if thread should be daemon.
+            **kwargs: Additional keyword arguments are passed to the
+                threading.Thread constructor.
+
+        """
         self.level = level
         self.prefix = prefix
         if isinstance(level, str):
@@ -39,14 +52,14 @@ class LogPipe(threading.Thread):
         super(LogPipe, self).__init__(daemon=daemon, **kwargs)
         self.start()
 
-    def close(self):
+    def close(self) -> None:
         r"""Close the pipe."""
         self.terminated.set()
         self.pipe.close()
         self.join()
 
-    def run(self):
-        """Run the thread, moving messages from the pipe to the
+    def run(self) -> None:
+        r"""Run the thread, moving messages from the pipe to the
         logger."""
         for line0 in iter(self.pipe.readline, ''):
             line = line0.decode().strip('\n')

@@ -12,9 +12,9 @@ import datetime
 from functools import cached_property
 import numpy as np
 import pandas as pd
-from typing import Optional, Union, Any, List, Callable
+from typing import Optional, Union, Any, List, Callable, Iterator
 from . import logger
-from .utils import _gymdir, _apsimxdir, _datadir, LogPipe
+from .utils import _apsimxdir, _datadir, LogPipe
 from .base import (
     readonly_cached_property,
     RecoverableError, ModelEngineError, InvalidActionError,
@@ -30,6 +30,16 @@ _syncfile = os.path.join(_datadir, "Synchroniser.json")
 
 
 def _read_resource(name, apsimx_dir: Optional[str] = _apsimxdir):
+    r"""Read a resource file from the APSIMX resources directory.
+
+    Args:
+        name: Name of the resource to read.
+        apsimx_dir: Directory containing the APSIMX installation.
+
+    Returns:
+        dict: Resource node matching the specified name.
+
+    """
     if not (isinstance(apsimx_dir, str) and os.path.isdir(apsimx_dir)):
         return {}
     resource = ApsimXFile(os.path.join(apsimx_dir, "Models", "Resources",
@@ -226,7 +236,16 @@ class ApsimXFileNode:
 
     def __init__(self, contents: dict,
                  parent: Optional["ApsimXFileNode" | None] = None,
-                 **kwargs):
+                 **kwargs: Any) -> None:
+        r"""Initialize a new node.
+
+        Args:
+            contents: Contents of the node.
+            parent: Parent node.
+            **kwargs: Additional keywords are added directly to the
+                node.
+
+        """
         self.contents = contents
         self.contents.update(**kwargs)
         self.parent = parent
@@ -236,7 +255,7 @@ class ApsimXFileNode:
                     self.contents["Children"][i] = x.contents
 
     @classmethod
-    def from_param(cls, node_type: str, **kwargs) -> "ApsimXFileNode":
+    def from_param(cls, node_type: str, **kwargs: Any) -> "ApsimXFileNode":
         r"""Create a new node from the provided parameters.
 
         Args:
@@ -262,7 +281,7 @@ class ApsimXFileNode:
         return cls(contents, **kwargs)
 
     @classmethod
-    def from_file(cls, fname: str, **kwargs):
+    def from_file(cls, fname: str, **kwargs: Any) -> "ApsimXFileNode":
         r"""Create a new node by loading code from the provided JSON
         file.
 
@@ -280,7 +299,7 @@ class ApsimXFileNode:
         return cls(contents, **kwargs)
 
     @classmethod
-    def from_data(cls, name: str, **kwargs):
+    def from_data(cls, name: str, **kwargs: Any) -> "ApsimXFileNode":
         r"""Create a new node by loading code from a data file.
 
         Args:
@@ -295,7 +314,8 @@ class ApsimXFileNode:
         fname = os.path.join(_datadir, f"{name}.json")
         return cls.from_file(fname, **kwargs)
 
-    def __str__(self):
+    def __str__(self) -> str:
+        r"""str: A string representation of this node."""
         return f"ApsimXFileNode({self.absolute_path})"
 
     # @cached_property
@@ -327,55 +347,72 @@ class ApsimXFileNode:
         return self.parent.absolute_path + "." + self["Name"]
 
     @property
-    def children(self) -> List["ApsimXFileNode"]:
+    def children(self) -> Iterator["ApsimXFileNode"]:
         r"""list: Child nodes."""
         for x in self.contents.get("Children", []):
             yield ApsimXFileNode(x, parent=self)
 
-    def __contains__(self, name):
+    def __contains__(self, name: str) -> bool:
+        r"""Check if the node contains the named element."""
         return name in self.contents
 
-    def __getitem__(self, name):
+    def __getitem__(self, name: str) -> Any:
+        r"""Get the value of the named element."""
         return self.contents[name]
 
-    def __setitem__(self, name, value):
+    def __setitem__(self, name: str, value: Any) -> None:
+        r"""Set the value of the named element."""
         self.contents[name] = value
 
-    def __delitem__(self, name):
+    def __delitem__(self, name: str) -> None:
+        r"""Remove the named element from the node."""
         del self.contents[name]
 
-    def get(self, name: str, default: Any):
+    def get(self, name: str, default: Any) -> Any:
+        r"""Get the value of the named element from the node.
+
+        Args:
+            name: Name of the element.
+            default: Value returned if the element is not present.
+
+        Returns:
+            object: Value of the named element.
+
+        """
         return self.contents.get(name, default)
 
-    def keys(self):
+    def keys(self) -> Iterator[str]:
         r"""Get the keys in the node."""
         for x in self.contents.keys():
             yield x
 
-    def values(self):
+    def values(self) -> Iterator[Any]:
         r"""Get the values in the node."""
         for x in self.contents.values():
             yield x
 
-    def items(self):
+    def items(self) -> Iterator[Any]:
         r"""Get the items in the node."""
         for x in self.contents.items():
             yield x
 
-    def specialize_crop(self, crop_name: str):
+    def specialize_crop(self, crop_name: str,
+                        parameter_name: str = "Crop") -> None:
         r"""Specialize the crop referenced by the node.
 
         Args:
             crop_name: Name of crop to specialize.
+            parameter_name: Parameter name where the crop name is
+                stored.
 
         """
-        if self.has_parameter("Crop"):
+        if self.has_parameter(parameter_name):
             if "CROP" in self["Name"]:
                 prev = "CROP"
             else:
-                prev = self.get_parameter("Crop")
+                prev = self.get_parameter(parameter_name)
             self["Name"] = self["Name"].replace(prev, crop_name)
-            self.set_parameter("Crop", crop_name)
+            self.set_parameter(parameter_name, crop_name)
         for x in self.children:
             x.specialize_crop(crop_name)
 
@@ -421,7 +458,7 @@ class ApsimXFileNode:
                 return x["Value"]
         raise KeyError(f"No parameter named \"{name}\" in {self}")
 
-    def set_parameter(self, name: str, value: Any):
+    def set_parameter(self, name: str, value: Any) -> None:
         r"""Set a node parameter.
 
         Args:
@@ -444,7 +481,8 @@ class ApsimXFileNode:
         raise KeyError(f"No parameter named \"{name}\" in {self}")
 
     def findall(self, name: Optional[str] = None,
-                requirements: Optional[dict] = None):
+                requirements: Optional[dict] = None,
+                ) -> Iterator["ApsimXFileNode"]:
         r"""Find a node in the file.
 
         Args:
@@ -515,7 +553,7 @@ class ApsimXFileNode:
                 calls: Optional[str] = None,
                 anyOf: Optional[list] = None,
                 nested: Optional[dict] = None,
-                **kwargs) -> bool:
+                **kwargs: Any) -> bool:
         r"""Check if a node matches the specified requirements.
 
         Args:
@@ -543,7 +581,16 @@ class ApsimXFileNode:
 
         """
 
-        def add_error(msg):
+        def add_error(msg: str) -> bool:
+            r"""Add an error message to the errors list.
+
+            Args:
+                msg: Error message to add.
+
+            Returns:
+                bool: True if the error was added, False otherwise.
+
+            """
             if not isinstance(errors, list):
                 return False
             errors.append(msg)
@@ -813,7 +860,7 @@ class ApsimXFile(CropModelFile):
     }
 
     @readonly_cached_property
-    def parameter_nodes(self):
+    def parameter_nodes(self) -> dict:
         r"""dict: Previously loaded parameter nodes."""
         return {}
 
@@ -1199,6 +1246,23 @@ class ApsimXFile(CropModelFile):
 
     @classmethod
     def _get_parameter(cls, node: dict, info: dict):
+        r"""Get a parameter value from a node based on the provided
+        information.
+
+        Args:
+            node: Node containing the parameter.
+            info: Information about how to locate the parameter.
+
+        Returns:
+            Parameter value.
+
+        Raises:
+            ValueError: If the node does not match any of the
+                requirements.
+            NotImplementedError: If info is invalid.
+            KeyError: If the parameter cannot be located.
+
+        """
         out = None
         if "parameter" in info:
             out = cls._get_node_parameter(node, info["parameter"])
@@ -1230,6 +1294,21 @@ class ApsimXFile(CropModelFile):
 
     @classmethod
     def _set_parameter(cls, node: dict, info: dict, value: Any):
+        r"""Set a parameter value in a node based on the provided
+        information.
+
+        Args:
+            node: Node containing the parameter.
+            info: Information about how to locate the parameter.
+            value: Value to set the parameter to.
+
+        Raises:
+            ValueError: If the node does not match any of the
+                requirements.
+            NotImplementedError: If info is invalid.
+            KeyError: If the parameter cannot be located.
+
+        """
         if isinstance(value, (datetime.datetime, datetime.date)):
             value = value.isoformat()
         if "fset" in info:
@@ -1349,13 +1428,13 @@ class ApsimXFile(CropModelFile):
             json.dump(contents, fd, indent="    ")
 
     @readonly_cached_property
-    def is_interactive(self):
+    def is_interactive(self) -> bool:
         r"""bool: True if the .apsimx model is interactive."""
         return bool(self.find("Synchroniser"))
 
     def disable_parameter_conflicts(self, name: str,
                                     info: Optional[dict] = None,
-                                    node: Optional[dict] = None):
+                                    node: Optional[dict] = None) -> None:
         r"""Disable nodes that conflict with a parameter/action.
 
         Args:
@@ -1436,7 +1515,7 @@ class ApsimXFile(CropModelFile):
                     self.generated = False
         return node
 
-    def disable_action(self, name: str, **kwargs):
+    def disable_action(self, name: str, **kwargs: Any) -> None:
         r"""Disable any nodes that automatically control an action.
 
         Args:
@@ -1451,7 +1530,7 @@ class ApsimXFile(CropModelFile):
             self.generated = False
 
     def enable_action(self, name: str, parent: Optional[dict] = None,
-                      **kwargs):
+                      **kwargs: Any) -> Optional[dict]:
         r"""Enable any nodes that automatically control an action.
 
         Args:
@@ -1475,7 +1554,7 @@ class ApsimXFile(CropModelFile):
             current=parent, **kwargs
         )
 
-    def disable(self, name: str, **kwargs):
+    def disable(self, name: str, **kwargs: Any) -> None:
         r"""Disable a node in the file if it exists.
 
         Args:
@@ -1516,7 +1595,7 @@ class ApsimXFile(CropModelFile):
                      calls: Optional[str] = None,
                      anyOf: Optional[list] = None,
                      nested: Optional[dict] = None,
-                     **kwargs) -> bool:
+                     **kwargs: Any) -> bool:
         r"""Check if a node matches the specified requirements.
 
         Args:
@@ -1545,7 +1624,16 @@ class ApsimXFile(CropModelFile):
 
         """
 
-        def add_error(msg):
+        def add_error(msg: str) -> bool:
+            r"""Add an error message to the errors list.
+
+            Args:
+                msg: Error message to add.
+
+            Returns:
+                bool: True if the error was added, False otherwise.
+
+            """
             if not isinstance(errors, list):
                 return False
             errors.append(msg)
@@ -1636,7 +1724,7 @@ class ApsimXFile(CropModelFile):
         return True
 
     def findall_parameters(self, name: str, info: Optional[dict] = None,
-                           **kwargs):
+                           **kwargs: Any) -> Iterator[dict]:
         r"""Find all parameters nodes in this file matching the
         parameter info.
 
@@ -1668,7 +1756,7 @@ class ApsimXFile(CropModelFile):
     def find_parameter(self, name: str,
                        add_missing: Optional[Union[bool, dict]] = False,
                        info: Optional[dict] = None,
-                       **kwargs) -> dict:
+                       **kwargs: Any) -> dict:
         r"""Find a parameter node in the file.
 
         Args:
@@ -1729,7 +1817,7 @@ class ApsimXFile(CropModelFile):
     def findall(self, name: Optional[str] = None,
                 current: Optional[dict] = None,
                 parent: Optional[bool] = False,
-                requirements: Optional[dict] = None) -> list:
+                requirements: Optional[dict] = None) -> Iterator[dict]:
         r"""Find a node in the file.
 
         Args:
@@ -1822,6 +1910,17 @@ _fertilizer_node = _read_resource("Fertiliser")
 def _fertilizer_action(name: Optional[str] = None,
                        solutes: Optional[List[str]] = None,
                        **kwargs):
+    r"""Construct an action specification for applying fertilizer.
+
+    Args:
+        name: Name of the fertilizer to apply.
+        solutes: Solutes that the fertilizer must contain.
+        **kwargs: Additional keywords are added to the action.
+
+    Returns:
+        dict: Action specification.
+
+    """
     if name is None:
         fullname = "fertilizer"
     else:
@@ -1984,8 +2083,18 @@ class ApsimXEngine(CropModelEngine):
             self,
             model_file: Optional[str] = None,
             model_dir: Optional[str] = None,
-            **kwargs
-    ):
+            **kwargs: Any
+    ) -> None:
+        r"""Initialize the engine.
+
+        Args:
+            model_file: Path to a .apsimx model input file.
+            model_dir: Path to the directory containing APSIMX
+                installation.
+            **kwargs: Additional keyword arguments are passed to the
+                CropModelEngine constructor.
+
+        """
         if model_dir is None:
             model_dir = _apsimxdir
         self.apsim_srv = os.path.join(
@@ -2020,20 +2129,20 @@ class ApsimXEngine(CropModelEngine):
         ]
 
     @property
-    def is_running(self):
+    def is_running(self) -> bool:
         r"""bool: True if the model engine is still running."""
         return (self.process is not None
                 and self.process.poll() is None)
 
     @property
-    def is_operable(self):
+    def is_operable(self) -> bool:
         r"""bool: True if the model engine is running and functioning."""
         if not super().is_operable:
             return False
         return (self._status not in ["finished", "error", "terminated"])
 
     @property
-    def current_time(self):
+    def current_time(self) -> datetime.datetime:
         r"""datetime.datetime: Current simulation time."""
         if self._current_time is None:
             if not self.is_operable:
@@ -2042,7 +2151,7 @@ class ApsimXEngine(CropModelEngine):
         return self._current_time
 
     @property
-    def status(self):
+    def status(self) -> Optional[str]:
         r"""str: Current simulation status."""
         if self._status is None and self.socket is not None:
             self._status = self.socket.recv_string()
@@ -2060,7 +2169,7 @@ class ApsimXEngine(CropModelEngine):
         return self._status
 
     @property
-    def output_file(self):
+    def output_file(self) -> str:
         r"""str: Path to the .db output file that will be produced."""
         return os.path.join(
             os.path.splitext(self.model.fname)[0] + ".db")
@@ -2161,7 +2270,7 @@ class ApsimXEngine(CropModelEngine):
             self.stdout_pipe = None
             self.stderr_pipe = None
 
-    def send_command(self, command: str, args: Optional[list] = None):
+    def send_command(self, command: str, args: Optional[list] = None) -> None:
         r"""Send a command to the server process, e.g. resume/set/get.
 
         Args:
@@ -2178,7 +2287,7 @@ class ApsimXEngine(CropModelEngine):
         if self.status != 'finished':
             self._status = None
 
-    def recv_reply(self, unpack: Optional[bool] = False):
+    def recv_reply(self, unpack: Optional[bool] = False) -> Any:
         r"""Receive a reply from the server process.
 
         Args:
@@ -2206,7 +2315,7 @@ class ApsimXEngine(CropModelEngine):
                 assert self._status == "paused"
         return out
 
-    def check_paused(self):
+    def check_paused(self) -> None:
         r"""Check that the simulation server is paused."""
         if self.status != "paused":
             raise ModelEngineError(
@@ -2215,7 +2324,7 @@ class ApsimXEngine(CropModelEngine):
 
     @contextlib.contextmanager
     def stop_on_error(self, record: Optional[tuple] = None,
-                      allow_error: Optional[bool] = False):
+                      allow_error: Optional[bool] = False) -> Iterator[None]:
         r"""Context manager that stops the simulation on an error.
 
         Args:
@@ -2237,6 +2346,15 @@ class ApsimXEngine(CropModelEngine):
             self._status = status
 
     def _reply_error(self, reply):
+        r"""Get the error class for the given error reply.
+
+        Args:
+            reply: Reply message received from the server.
+
+        Returns:
+            type: Error class to raise for the reply.
+
+        """
         if reply == "recoverable_error":
             error_cls = RecoverableModelEngineError
         else:
@@ -2311,7 +2429,7 @@ class ApsimXEngine(CropModelEngine):
                f"\"{reply}\""
             )
 
-    def resume(self, wait: Optional[bool] = False):
+    def resume(self, wait: Optional[bool] = False) -> None:
         r"""Resume the simulation.
 
         Args:

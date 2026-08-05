@@ -4,13 +4,21 @@ import sys
 import argparse
 import datetime
 import logging
+from typing import Any
 from . import logger
 from .utils import _apsimxdir
 from .engine import ApsimXFile, ApsimXEngine
 
 
-def run(model, **kwargs):
-    r"""Run a simulation."""
+def run(model: str, **kwargs: Any) -> None:
+    r"""Run a simulation.
+
+    Args:
+        model: Path to a .apsimx model input file.
+        **kwargs: Additional keyword arguments are passed along to
+            ApsimXEngine.__init__.
+
+    """
     apsim = ApsimXEngine(model, **kwargs)
     apsim.start()
     try:
@@ -38,7 +46,8 @@ def run(model, **kwargs):
     print(f"Output written to {apsim.output_file}")
 
 
-def main():
+def main() -> None:
+    r"""Run the command line interface."""
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(
         dest="action", help='Action to perform')

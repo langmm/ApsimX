@@ -7,7 +7,9 @@ import datetime
 import contextlib
 from collections import defaultdict
 from abc import ABC, ABCMeta, abstractmethod
-from typing import Optional, Union, Dict, List, Tuple, Any, Callable
+from typing import (
+    Optional, Union, Dict, List, Tuple, Any, Callable, Iterator,
+)
 from functools import cached_property
 import numpy as np
 import gymnasium as gym
@@ -39,7 +41,7 @@ class InvalidActionError(RecoverableError):
     pass
 
 
-def readonly_cached_property(method: Callable):
+def readonly_cached_property(method: Callable) -> Callable:
     r"""Decorator for a read-only cached property.
 
     Args:
@@ -50,7 +52,8 @@ def readonly_cached_property(method: Callable):
     name = method.__qualname__.rsplit('.', 1)[-1]
 
     @property
-    def _readonly_cached_property(self):
+    def _readonly_cached_property(self) -> Any:
+        r"""Get the cached property value, computing it if needed."""
         if name not in self._cached_properties:
             self._cached_properties[name] = method(self)
         return self._cached_properties[name]
@@ -61,14 +64,28 @@ def readonly_cached_property(method: Callable):
 class CachedPropertyMixin:
     r"""Mixin class for enabling read-only cached properties."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        r"""Initialize the cached property mixin.
+
+        Args:
+            *args: Positional arguments passed to the parent class.
+            **kwargs: Keyword arguments passed to the parent class.
+
+        """
         self._cached_properties = {}
         super().__init__(*args, **kwargs)
 
-    def _clear_cached_property(self, name: str):
+    def _clear_cached_property(self, name: str) -> None:
+        r"""Remove a cached property value.
+
+        Args:
+            name: Name of the property to clear.
+
+        """
         self._cached_properties.pop(name, None)
 
-    def _clear_cached_properties(self):
+    def _clear_cached_properties(self) -> None:
+        r"""Clear all cached property values."""
         self._cached_properties.clear()
 
 
@@ -152,7 +169,31 @@ class ModelAction(CachedPropertyMixin):
             param: Optional[dict] = None,
             allow_donothing: Optional[bool] = True,
             offset: Optional[int] = 0,
-    ):
+    ) -> None:
+        r"""Initialize a model action.
+
+        Args:
+            name: Action name.
+            description: Action description.
+            alias: Action alias.
+            keywords: Key words or phrases identifying this action.
+            cost: Action cost. If the action produces a float, this
+                should be the cost per action unit.
+            action_param: Parameter that action will set.
+            num_levels: Number of levels that the action supports for
+                the action parameter. 0 indicates a continuous action,
+                -1 indicates a boolean action.
+            levels: Explicit levels for the action parameter.
+            bounds: Explicit bounds for the action parameter (numbers
+                only).
+            param_desc: Descriptions of parameters supported by the
+                action.
+            param: Values for additional parameters that should be used.
+            allow_donothing: If True, the action should allow for a
+                choice to do nothing.
+            offset: Action offset when part of a discrete set.
+
+        """
         self.name = name
         self.description_fstring = description
         self.alias = alias
@@ -178,7 +219,7 @@ class ModelAction(CachedPropertyMixin):
         super().__init__()
 
     @readonly_cached_property
-    def additional_param(self):
+    def additional_param(self) -> list:
         r"""list: Set of additional parameters."""
         return [k for k in self.param_desc.keys()
                 if k != self.action_param]
@@ -211,7 +252,7 @@ class ModelAction(CachedPropertyMixin):
         return out
 
     @readonly_cached_property
-    def bounds(self):
+    def bounds(self) -> Optional[tuple]:
         r"""tuple: Minimum and maximum bounds for action value."""
         if self._bounds:
             return self._bounds
@@ -235,7 +276,7 @@ class ModelAction(CachedPropertyMixin):
         return (le, re)
 
     @readonly_cached_property
-    def levels(self):
+    def levels(self) -> Optional[list]:
         r"""list: Set of discrete levels for the action."""
         if self._levels:
             return self._levels
@@ -299,7 +340,7 @@ class ModelAction(CachedPropertyMixin):
         return self.levels
 
     def set_param(self, param: dict,
-                  src: Optional[str] = "set_param"):
+                  src: Optional[str] = "set_param") -> None:
         r"""Update the action parameters.
 
         Args:
@@ -328,7 +369,7 @@ class ModelAction(CachedPropertyMixin):
         assert self.action_param not in self.param
         self._clear_cached_properties()
 
-    def scale_action_amounts(self, scale: Union[int, float]):
+    def scale_action_amounts(self, scale: Union[int, float]) -> None:
         r"""Scale action limits/levels.
 
         Args:
@@ -358,7 +399,7 @@ class ModelAction(CachedPropertyMixin):
         return (self.num_levels == -1)
 
     @readonly_cached_property
-    def example_value(self):
+    def example_value(self) -> Any:
         r"""object: Example action value."""
         if self.num_levels == 0:
             for x in self.bounds[::-1]:
@@ -440,7 +481,7 @@ class ModelAction(CachedPropertyMixin):
         #     rj.validate(self.param_desc[k], v)
         return kws
 
-    def args2cost(self, args: tuple):
+    def args2cost(self, args: tuple) -> float:
         r"""Convert a set of action arguments to the action cost.
 
         Args:
@@ -459,7 +500,7 @@ class ModelAction(CachedPropertyMixin):
             return self.cost
         return self.cost * args[0]
 
-    def description2action(self, description: str):
+    def description2action(self, description: str) -> Union[int, np.ndarray]:
         r"""Parse a description to get an action ID.
 
         Args:
@@ -483,7 +524,7 @@ class ModelAction(CachedPropertyMixin):
         """
         return re.search(self.description_regex, description)
 
-    def fuzzy_search_description(self, description: str):
+    def fuzzy_search_description(self, description: str) -> Any:
         r"""Search a description for a match to this action by looking
         for keywords.
 
@@ -507,7 +548,7 @@ class ModelAction(CachedPropertyMixin):
                                  f"via fuzzy search: "
                                  f"\"{description}\"")
 
-    def match2value(self, match: re.Match):
+    def match2value(self, match: re.Match) -> Any:
         r"""Convert a regex search result into an action value.
 
         Args:
@@ -534,7 +575,7 @@ class ModelAction(CachedPropertyMixin):
             return False
         raise InvalidActionError("No match")
 
-    def description2value(self, description: str):
+    def description2value(self, description: str) -> Any:
         r"""Parse a description for a action value.
 
         Args:
@@ -550,7 +591,7 @@ class ModelAction(CachedPropertyMixin):
         raise InvalidActionError(f"Failed to parse description "
                                  f"via regex: \"{description}\"")
 
-    def value2action(self, value):
+    def value2action(self, value: Any) -> Union[int, np.ndarray]:
         r"""Convert an action value into an action ID.
 
         Args:
@@ -578,7 +619,7 @@ class ModelAction(CachedPropertyMixin):
             return self.offset + np.argmin(diff)
         raise InvalidActionError(f"{value} is not a valid choice")
 
-    def action2value(self, action: Union[int, np.ndarray]):
+    def action2value(self, action: Union[int, np.ndarray]) -> Any:
         r"""Convert an action ID into a parameter value.
 
         Args:
@@ -622,7 +663,7 @@ class ModelAction(CachedPropertyMixin):
             )
         return self.choices[action_rel]
 
-    def value2args(self, value) -> tuple:
+    def value2args(self, value: Any) -> tuple:
         r"""Convert an action value to arguments.
 
         Args:
@@ -639,7 +680,8 @@ class ModelAction(CachedPropertyMixin):
             return tuple(value.tolist() + self.additional_param_args)
         return tuple([value] + self.additional_param_args)
 
-    def action2description(self, action) -> str:
+    def action2description(
+            self, action: Union[int, np.ndarray]) -> str:
         r"""Convert an action ID into a natural language description.
 
         Args:
@@ -651,7 +693,8 @@ class ModelAction(CachedPropertyMixin):
         """
         return self.format_description(value=self.action2value(action))
 
-    def action2args(self, action) -> tuple:
+    def action2args(
+            self, action: Union[int, np.ndarray]) -> tuple:
         r"""Convert an action ID into arguments that can be passed to
         BaseModelEngine.act.
 
@@ -666,6 +709,15 @@ class ModelAction(CachedPropertyMixin):
 
     @classmethod
     def _format_value(cls, value) -> str:
+        r"""Format a single value for inclusion in a description.
+
+        Args:
+            value: Value to format.
+
+        Returns:
+            str: Formatted value.
+
+        """
         if isinstance(value, str):
             return value
         elif isinstance(value, float):
@@ -683,6 +735,15 @@ class ModelAction(CachedPropertyMixin):
 
     @classmethod
     def _format_choice_list(cls, values: list) -> str:
+        r"""Format a list of choices as a natural language string.
+
+        Args:
+            values: Values to format.
+
+        Returns:
+            str: Formatted choice list.
+
+        """
         if not values:
             return ""
         values = [cls._format_value(v) for v in values]
@@ -693,7 +754,7 @@ class ModelAction(CachedPropertyMixin):
         return f"{', '.join(values[:-1])}, or {values[-1]}"
 
     def format_description(
-            self, value=None,
+            self, value: Optional[Any] = None,
             param: Optional[dict] = None,
     ) -> str:
         r"""Format a description of the action.
@@ -740,6 +801,15 @@ class ModelAction(CachedPropertyMixin):
 
     @classmethod
     def _param2regex(cls, desc: dict) -> str:
+        r"""Create a regex string for matching a parameter value.
+
+        Args:
+            desc: Parameter description.
+
+        Returns:
+            str: Regex string for matching the parameter.
+
+        """
         if desc["type"] == "string":
             if "enum" in desc:
                 return "|".join(f"(?:{x})" for x in desc["enum"])
@@ -827,7 +897,15 @@ class DoNothingModelAction(ModelAction):
             description: Optional[str] = "Do nothing.",
             keywords: Optional[list] = [
                 "do nothing", "take no action"
-            ]):
+            ]) -> None:
+        r"""Initialize a do-nothing model action.
+
+        Args:
+            name: Action name.
+            description: Action description.
+            keywords: Key words or phrases identifying this action.
+
+        """
         super().__init__(
             name,
             description=description,
@@ -859,7 +937,21 @@ class ModelActionSet(CachedPropertyMixin):
             exclusive: Optional[bool] = True,
             default_action_map: Optional[dict] = None,
             param: Optional[dict] = None,
-    ):
+    ) -> None:
+        r"""Initialize a set of model actions.
+
+        Args:
+            action_map: Mapping between action names and descriptions.
+            num_levels: Number of levels per action if not specified in
+                action_map (0 for continuous, -1 for boolean).
+            allow_donothing: Include non-action as a possible action.
+            exclusive: Don't allow more than one action per step.
+            default_action_map: Mapping of default action descriptions
+                that should be used to fill in missing information in
+                action_map.
+            param: Action parameters to use keyed to action names.
+
+        """
         self.actions = {}
         self.num_levels = num_levels
         self.allow_donothing = allow_donothing
@@ -890,7 +982,7 @@ class ModelActionSet(CachedPropertyMixin):
 
     @classmethod
     def create(cls, action_map: Union["ModelActionSet", dict],
-               **kwargs) -> "ModelActionSet":
+               **kwargs: Any) -> "ModelActionSet":
         r"""Create a ModelActionSet from a dictionary. If an existing
         ModelActionSet instance is provided, it is returned.
 
@@ -910,25 +1002,27 @@ class ModelActionSet(CachedPropertyMixin):
             return action_map
         return cls(action_map, **kwargs)
 
-    def __getitem__(self, k):
+    def __getitem__(self, k: str) -> ModelAction:
+        r"""Get an action by name."""
         return self.actions[k]
 
-    def __contains__(self, k):
+    def __contains__(self, k: str) -> bool:
+        r"""Check if an action is in the set."""
         return k in self.actions
 
-    def items(self):
+    def items(self) -> Any:
         r"""Action items."""
         return self.actions.items()
 
-    def keys(self):
+    def keys(self) -> Any:
         r"""Action keys."""
         return self.actions.keys()
 
-    def values(self):
+    def values(self) -> Any:
         r"""Action values."""
         return self.actions.values()
 
-    def pop(self, k, default=NoDefault):
+    def pop(self, k: str, default: Any = NoDefault) -> Any:
         r"""Remove an action."""
         if k in self.actions:
             out = self.actions.pop(k)
@@ -938,7 +1032,13 @@ class ModelActionSet(CachedPropertyMixin):
             raise KeyError(k)
         return default
 
-    def _on_edit_actions(self, in_init=False):
+    def _on_edit_actions(self, in_init: bool = False) -> None:
+        r"""Update action offsets after the set is edited.
+
+        Args:
+            in_init: If True, cached properties are not cleared.
+
+        """
         if self.exclusive and self.discrete:
             nprev = 0
             for desc in self.actions.values():
@@ -949,7 +1049,7 @@ class ModelActionSet(CachedPropertyMixin):
         self._clear_cached_properties()
 
     def set_param(self, param: dict, action: Optional[str] = None,
-                  src: Optional[str] = "set_param"):
+                  src: Optional[str] = "set_param") -> None:
         r"""Update the action parameters that match the provided keywords.
 
         Args:
@@ -979,7 +1079,7 @@ class ModelActionSet(CachedPropertyMixin):
         if update:
             self._on_edit_actions()
 
-    def scale_action_amounts(self, scale: Union[int, float]):
+    def scale_action_amounts(self, scale: Union[int, float]) -> None:
         r"""Scale action limits/levels.
 
         Args:
@@ -1024,7 +1124,7 @@ class ModelActionSet(CachedPropertyMixin):
         return all(x.discrete for x in self.actions.values())
 
     @readonly_cached_property
-    def donothin_action(self):
+    def donothin_action(self) -> Any:
         r"""object: Action ID to do nothing."""
         if not self.allow_donothing:
             return None
@@ -1035,7 +1135,7 @@ class ModelActionSet(CachedPropertyMixin):
         return (0, 0)
 
     @readonly_cached_property
-    def example_value(self):
+    def example_value(self) -> dict:
         r"""object: Example action value."""
         if self.exclusive:
             last = self.actions[self.action_order[-1]]
@@ -1079,7 +1179,7 @@ class ModelActionSet(CachedPropertyMixin):
             for action, desc in self.actions.items()
         })
 
-    def description2action(self, description: str):
+    def description2action(self, description: str) -> Union[int, tuple, dict]:
         r"""Parse a description to get an action ID.
 
         Args:
@@ -1091,7 +1191,7 @@ class ModelActionSet(CachedPropertyMixin):
         """
         return self.value2action(self.description2value(description))
 
-    def description2value(self, description: str):
+    def description2value(self, description: str) -> dict:
         r"""Parse a description for a action value.
 
         Args:
@@ -1160,7 +1260,7 @@ class ModelActionSet(CachedPropertyMixin):
                 + "\n  - ".join(errors))
         return out
 
-    def value2action(self, value: dict):
+    def value2action(self, value: dict) -> Union[int, tuple, dict]:
         r"""Convert an action value into an action ID.
 
         Args:
@@ -1183,7 +1283,9 @@ class ModelActionSet(CachedPropertyMixin):
         else:
             return (self.action_order.index(name), action)
 
-    def action2value(self, action: Union[int, tuple, dict, np.ndarray]):
+    def action2value(
+            self,
+            action: Union[int, tuple, dict, np.ndarray]) -> dict:
         r"""Convert an action ID into a map of action values.
 
         Args:
@@ -1340,7 +1442,17 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
     def __init__(self, fname: str, generated: Optional[bool] = False,
                  contents: Optional[dict] = None,
-                 fname_orig: Optional[str] = None):
+                 fname_orig: Optional[str] = None) -> None:
+        r"""Initialize a model file wrapper.
+
+        Args:
+            fname: Path to a model file.
+            generated: If True, this file was generated.
+            contents: Contents to initialize the file with.
+            fname_orig: Original model file that this one was generated
+                from.
+
+        """
         self.fname = fname
         self.fname_orig = fname_orig or fname
         self.generated = generated
@@ -1348,10 +1460,11 @@ class BaseModelFile(CachedPropertyMixin, ABC):
             self.contents = contents
         super().__init__()
 
-    def __del__(self):
+    def __del__(self) -> None:
+        r"""Cleanup any generated file."""
         self.cleanup()
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         r"""Cleanup any generated file."""
         if self.generated and self.exists and not self.CACHED:
             os.remove(self.fname)
@@ -1413,7 +1526,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
         raise KeyError(name)
 
     @staticmethod
-    def parameter_property(method: Callable):
+    def parameter_property(method: Callable) -> property:
         r"""Decorator for a BaseModelFile method that produces the default
         value that should be used if a KeyError is not raised by
         BaseModelFile.get(<property name>).
@@ -1427,6 +1540,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
 
         @property
         def _parameter_property(self):
+            r"""Get the parameter value, computing it if missing."""
             try:
                 return self.get(name)
             except KeyError:
@@ -1436,18 +1550,19 @@ class BaseModelFile(CachedPropertyMixin, ABC):
         return _parameter_property
 
     @cached_property
-    def contents(self):
+    def contents(self) -> Any:
         r"""object: File contents."""
         return self._read(self.fname)
 
     @readonly_cached_property
     @abstractmethod
-    def is_interactive(self):
+    def is_interactive(self) -> bool:
         r"""bool: True if the model file is interactive."""
         raise NotImplementedError  # pragma: no cover
 
     @contextlib.contextmanager
-    def prevent_overwrite(self, suffix: Optional[str] = "-Modified"):
+    def prevent_overwrite(self, suffix: Optional[str] = "-Modified"
+                          ) -> Iterator[None]:
         r"""Context to ensure that a duplicate is made if the context
         exits successfully during modification of the file contents.
 
@@ -1463,16 +1578,16 @@ class BaseModelFile(CachedPropertyMixin, ABC):
         self._clear_cached_properties()
 
     @parameter_property
-    def output_vars(self):
+    def output_vars(self) -> list:
         r"""list: Output variables."""
         return []
 
     @property
-    def exists(self):
+    def exists(self) -> bool:
         r"""bool: True if the file exists."""
         return os.path.isfile(self.fname)
 
-    def get(self, name: str, default=NoDefault):
+    def get(self, name: str, default: Any = NoDefault) -> Any:
         r"""Get a parameter from the model file.
 
         Args:
@@ -1494,7 +1609,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
                 return default
             raise
 
-    def set(self, name: str, value: Any) -> Any:
+    def set(self, name: str, value: Any) -> None:
         r"""Set a parameter in the model file.
 
         Args:
@@ -1509,7 +1624,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
             self._set(name, value)
 
     def write(self, new_contents: Optional[dict] = None,
-              overwrite: Optional[bool] = False):
+              overwrite: Optional[bool] = False) -> None:
         r"""Write a new set of contents to the file.
 
         Args:
@@ -1562,7 +1677,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
                              f"\"{self.fname}\"")
         return self.fname
 
-    def copy(self, **kwargs) -> "BaseModelFile":
+    def copy(self, **kwargs: Any) -> "BaseModelFile":
         r"""Create a copy of this .apsimx model.
 
         Args:
@@ -1579,7 +1694,7 @@ class BaseModelFile(CachedPropertyMixin, ABC):
             out.move(**kwargs)
         return out
 
-    def make_interactive(self, actions: list):
+    def make_interactive(self, actions: list) -> None:
         r"""Modify this file to make it interactive.
 
         Args:
@@ -1647,7 +1762,29 @@ class BaseModelEngine(ABC):
             actions: Optional[List[str]] = None,
             action_map: Optional[Union[dict, ModelActionSet]] = None,
             action_param: Optional[dict] = None,
-    ):
+    ) -> None:
+        r"""Initialize the model engine.
+
+        Args:
+            model_file: Path to one or more model input files.
+            model_dir: Path to the directory containing the model.
+            model_suffix: Additional suffix to add to a copy of the
+                provided model file to ensure that it is unique.
+            output_dir: Path to the directory where output should be
+                saved.
+            start_time: Simulation start time.
+            end_time: Simulation end time.
+            duration: Simulation duration. Only used if either
+                start_time or end_time is not provided.
+            param: Model parameters to update at the beginning of the
+                simulation.
+            actions: Names of actions to include. Only used if action_map
+                not provided.
+            action_map: Description of actions available via the act
+                method.
+            action_param: Action parameters to use keyed to action names.
+
+        """
         self.model_file = model_file
         self.model_dir = model_dir
         self.model_suffix = model_suffix
@@ -1871,7 +2008,7 @@ class BaseModelEngine(ABC):
         raise KeyError(name)
 
     def calc_param(self, name: str, default: Optional[Any] = NoDefault,
-                   **kwargs):
+                   **kwargs: Any) -> Any:
         r"""Calculate a parameter from other parameters.
 
         Args:
@@ -1966,7 +2103,8 @@ class BaseModelEngine(ABC):
     def sync_param(self, names: Optional[List[str]] = None,
                    required: Optional[bool] = False,
                    dont_update: Optional[bool] = False,
-                   skip_file: Optional[bool] = False, **kwargs):
+                   skip_file: Optional[bool] = False,
+                   **kwargs: Any) -> None:
         r"""Set/get explicit model file parameters.
 
         Args:
@@ -2001,7 +2139,7 @@ class BaseModelEngine(ABC):
         if not dont_update:
             self.update_param_in_file(names, required=required)
 
-    def update_model_file(self):
+    def update_model_file(self) -> None:
         r"""Update the model file to make it interactive and set the
         start/end times."""
         if not self.model.is_interactive:
@@ -2022,7 +2160,7 @@ class BaseModelEngine(ABC):
 
     @classmethod
     def select_actions(cls, actions: Optional[List[str]] = None,
-                       action_map: Optional[dict] = None):
+                       action_map: Optional[dict] = None) -> dict:
         r"""Select a set of default actions.
 
         Args:
@@ -2051,31 +2189,32 @@ class BaseModelEngine(ABC):
         return self.model.output_vars
 
     @property
-    def is_complete(self):
+    def is_complete(self) -> bool:
         r"""bool: True if the simulation is complete."""
         return self.current_time >= self.end_time
 
-    def __del__(self):
+    def __del__(self) -> None:
+        r"""Stop the model engine and cleanup the model file."""
         self.stop(cleanup=True)
 
     @property
     @abstractmethod
-    def is_running(self):
+    def is_running(self) -> bool:
         r"""bool: True if the model engine is still running."""
         raise NotImplementedError  # pragma: no cover
 
     @property
-    def is_operable(self):
+    def is_operable(self) -> bool:
         r"""bool: True if the model engine is running and functioning."""
         return self.is_running
 
     @property
     @abstractmethod
-    def current_time(self):
+    def current_time(self) -> datetime.datetime:
         r"""datetime.datetime: Current simulation time."""
         raise NotImplementedError  # pragma: no cover
 
-    def start(self):
+    def start(self) -> None:
         r"""Start the model engine."""
         self._start()
         self.setvars(self.initial_param_dynamic)
@@ -2097,7 +2236,7 @@ class BaseModelEngine(ABC):
         r"""Start the model engine."""
         raise NotImplementedError  # pragma: no cover
 
-    def stop(self, cleanup: Optional[bool] = False):
+    def stop(self, cleanup: Optional[bool] = False) -> None:
         r"""Stop the model engine.
 
         Args:
@@ -2110,13 +2249,13 @@ class BaseModelEngine(ABC):
             if cleanup:
                 self.model.cleanup()
 
-    def cleanup(self, remove_output: Optional[bool] = False):
+    def cleanup(self, remove_output: Optional[bool] = False) -> None:
         r"""Cleanup the model."""
         self.model.cleanup()
         if remove_output:
             self.cleanup_output()
 
-    def cleanup_output(self):
+    def cleanup_output(self) -> None:
         r"""Cleanup model output."""
         for x in self.products:
             if os.path.isfile(x):
@@ -2127,7 +2266,7 @@ class BaseModelEngine(ABC):
         r"""Stop the model engine."""
         raise NotImplementedError  # pragma: no cover
 
-    def reset(self):
+    def reset(self) -> None:
         r"""Re-start the model."""
         self.stop()
         self.start()
@@ -2171,7 +2310,7 @@ class BaseModelEngine(ABC):
 
     @contextlib.contextmanager
     def stop_on_error(self, record: Optional[tuple] = None,
-                      allow_error: Optional[bool] = False):
+                      allow_error: Optional[bool] = False) -> Iterator[None]:
         r"""Context manager that stops the simulation on an error.
 
         Args:
@@ -2193,7 +2332,7 @@ class BaseModelEngine(ABC):
             self.stop()
             raise
 
-    def get(self, name: str, allow_error: Optional[bool] = False):
+    def get(self, name: str, allow_error: Optional[bool] = False) -> Any:
         r"""Send a request to get the current value of a simulation state
         variable.
 
@@ -2212,7 +2351,8 @@ class BaseModelEngine(ABC):
         logger.debug(f"get: {name} -> {out}")
         return out
 
-    def set(self, name: str, value, allow_error: Optional[bool] = False):
+    def set(self, name: str, value: Any,
+            allow_error: Optional[bool] = False) -> Any:
         r"""Send a request to set a simulation state variable.
 
         Args:
@@ -2229,9 +2369,9 @@ class BaseModelEngine(ABC):
         logger.debug(f"set: {name} -> {value}")
         return out
 
-    def act(self, action: str, *args,
+    def act(self, action: str, *args: Any,
             allow_error: Optional[bool] = False,
-            **kwargs):
+            **kwargs: Any) -> Any:
         r"""Perform an action.
 
         Args:
@@ -2263,7 +2403,8 @@ class BaseModelEngine(ABC):
             self.resume(wait=True)
         return out
 
-    def getvars(self, names: list, allow_error: Optional[bool] = False):
+    def getvars(self, names: list,
+                allow_error: Optional[bool] = False) -> dict:
         r"""Send a request to get the current value of a set of
         simulation state variables.
 
@@ -2282,7 +2423,8 @@ class BaseModelEngine(ABC):
             out[name] = self.get(name, allow_error=allow_error)
         return out
 
-    def setvars(self, values: dict, allow_error: Optional[bool] = False):
+    def setvars(self, values: dict,
+                allow_error: Optional[bool] = False) -> None:
         r"""Send a request to set simulation state variables.
 
         Args:
@@ -2295,7 +2437,8 @@ class BaseModelEngine(ABC):
         for k, v in values.items():
             self.set(k, v, allow_error=allow_error)
 
-    def actvars(self, values: dict, allow_error: Optional[bool] = False):
+    def actvars(self, values: dict,
+                allow_error: Optional[bool] = False) -> None:
         r"""Perform multiple actions.
 
         Args:
@@ -2308,7 +2451,7 @@ class BaseModelEngine(ABC):
         for k, v in values.items():
             self.act(k, *v, allow_error=allow_error)
 
-    def record(self, *args):
+    def record(self, *args: Any) -> None:
         r"""Record an action.
 
         Args:
@@ -2321,7 +2464,7 @@ class BaseModelEngine(ABC):
             self, time: Union[datetime.datetime,
                               datetime.timedelta,
                               int, str]
-    ):
+    ) -> None:
         r"""Fast forwrad or rewind the simulation to the desired time.
 
         Args:
@@ -2351,7 +2494,7 @@ class BaseModelEngine(ABC):
             self, time: Optional[Union[datetime.datetime,
                                        datetime.timedelta,
                                        int, str]] = None
-    ):
+    ) -> None:
         r"""Fast forward the simulation to the desired time.
 
         Args:
@@ -2385,7 +2528,7 @@ class BaseModelEngine(ABC):
 
     def rewind(self, time: Optional[Union[datetime.datetime,
                                           datetime.timedelta,
-                                          int, str]] = None):
+                                          int, str]] = None) -> None:
         r"""Rewind the simulation to a previous time.
 
         Args:
@@ -2423,7 +2566,7 @@ class BaseModelEngine(ABC):
             self.fast_forward(time)
 
     @abstractmethod
-    def resume(self, wait: Optional[bool] = False):
+    def resume(self, wait: Optional[bool] = False) -> None:
         r"""Resume the simulation.
 
         Args:
@@ -2463,7 +2606,7 @@ class BaseModelLLMPromptGenerator(CachedPropertyMixin, ABC):
             thinking_mode: str = "grounding_decision",
             think_tag: str = "think",
             answer_tag: str = "answer",
-    ):
+    ) -> None:
         """Initialize the prompt generator.
 
         Args:
@@ -2722,7 +2865,7 @@ class BaseModelLLMPromptGenerator(CachedPropertyMixin, ABC):
     def from_env(
             cls,
             env: "BaseModelEnv",
-            **kwargs
+            **kwargs: Any
     ) -> "BaseModelLLMPromptGenerator":
         """Create prompt generator from a model gym environment.
 
@@ -2797,8 +2940,35 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             allow_donothing: Optional[bool] = True,
             exclusive: Optional[bool] = True,
             scale_action_amounts_by_interval: Optional[bool] = False,
-            **kwargs
-    ):
+            **kwargs: Any
+    ) -> None:
+        r"""Initialize the environment.
+
+        Args:
+            model_file: Path to one or more model input files.
+            start_time: Simulation start time.
+            end_time: Simulation end time.
+            intervention_interval: Time between decisions. If an integer
+                is provided, the units will be assumed to be days.
+            output_vars: List of observation variable names.
+            num_levels: Number of levels per action if not specified in
+                action_map (0 for continuous, -1 for boolean).
+            actions: Names of actions to include. Only used if action_map
+                not provided.
+            action_map: Custom description mapping for actions.
+            revenue_var: Description of how profit should be calculated
+                from an output variable.
+            model_param: Initial model parameters to set in the model
+                file and/or when the simulation begins.
+            action_param: Action parameters to use keyed to action names.
+            allow_donothing: Include non-action as a possible action.
+            exclusive: Don't allow more than one action per step.
+            scale_action_amounts_by_interval: If True, scale action
+                amounts by the intervention interval.
+            **kwargs: Additional keyword arguments are passed to the
+                model engine constructor.
+
+        """
         self.model_file = model_file
         self.start_time = start_time
         self.end_time = end_time
@@ -2862,12 +3032,12 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         self.log = self._init_log()
 
     @property
-    def current_time(self):
+    def current_time(self) -> datetime.datetime:
         r"""datetime.dateime: Current time."""
         return self.model.current_time
 
     @property
-    def intervention_timedelta(self):
+    def intervention_timedelta(self) -> datetime.timedelta:
         r"""datetime.timedelta: Intervention interval as delta."""
         if isinstance(self.intervention_interval, datetime.timedelta):
             return self.intervention_interval
@@ -2907,7 +3077,7 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         self.log["reward"][self.current_time] = reward
         self.log["time"][self.current_time] = self.current_time
 
-    def create_model(self, **kwargs) -> BaseModelEngine:
+    def create_model(self, **kwargs: Any) -> BaseModelEngine:
         r"""Create a new model engine."""
         return self.MODEL_ENGINE_CLASS(
             model_file=self.model_file,
@@ -2918,13 +3088,13 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
             **kwargs
         )
 
-    def close(self):
+    def close(self) -> None:
         r"""Close the environment."""
         self.model.stop(cleanup=True)
         super().close()
 
     def get_llm_prompt_generator(
-            self, **kwargs) -> "BaseModelLLMPromptGenerator":
+            self, **kwargs: Any) -> "BaseModelLLMPromptGenerator":
         r"""Create an LLM prompt generator for this environment.
 
         Args:
@@ -3037,7 +3207,9 @@ class BaseModelEnv(gym.Env, metaclass=ABCMeta):
         observation = self._get_obs()
         return self._process_observation(observation), self.log
 
-    def step(self, action) -> tuple[np.ndarray, float, bool, bool, dict]:
+    def step(self,
+             action: Union[int, np.ndarray]
+             ) -> tuple[np.ndarray, float, bool, bool, dict]:
         """Execute one timestep within the environment.
 
         Args:

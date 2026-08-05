@@ -4,9 +4,19 @@ This directory includes the necessary components for deploying a REST API for ru
 
 ## Files
 
-- config.py - Pydantic models for REST API requests that call ApsimX via apsimx_gym
-- main.py - fastapi application
-- make_n8n_form.py - Utilities for creating/updating ApsimX n8n tools
+- config.py - Pydantic models for REST API requests that call ApsimX via apsimx_gym, including request schemas for starting (interactive) models, getting/setting state variables, and performing actions, plus an `InteractiveModelRegistry` for managing running interactive models and a `Settings` model that reads the APSIMX root directory from the `APSIMX_DIR` environment variable
+- main.py - FastAPI application exposing the REST API endpoints (status, start, start-interactive, and the interactive-model get/set/act/continue/complete/restart/stop/scrub/status/trace endpoints)
+- make_n8n_form.py - Utilities and CLI for creating/updating/removing/querying ApsimX n8n tools by converting Pydantic request schemas into n8n form trigger workflows that POST to the deployed service
+- beam_asgi.py - beam.cloud ASGI deployment definition that builds the `Dockerfile.beam_runner` image and serves the FastAPI app (currently does not work, see "Beam Deployment" below)
+- beam_docker.py - beam.cloud ASGI deployment definition that serves the FastAPI app using the main `Dockerfile` image
+- beam_pod.py - beam.cloud Pod deployment definition that runs the main `Dockerfile` image with an exposed port
+- beam_cloud_base_requirements.txt - Base Python requirements installed in the beam runner image (from beam.cloud's beta9 base requirements)
+- Dockerfile - Image for local and docker-based deployments: sets up a conda environment, builds the APSIM ZMQ server, installs ApsimXGym, and runs the FastAPI app
+- Dockerfile.beam_runner - beam.cloud runner image based on Ubuntu with micromamba that copies the repository, creates a Python environment, and installs the base requirements
+- environment.yml - Conda environment with the dependencies needed to run the FastAPI app, ApsimXGym, and the APSIM ZMQ server
+- launch_local.sh - Script that launches the FastAPI app with `fastapi run` on the port given by the `PORT` environment variable
+- tests/ - pytest suite covering the REST API endpoints against both a locally-launched server and a remote (beam) deployment via `APSIMX_REMOTE_ADDRESS`
+- scratch/ - Directory where generated n8n tool/form JSON payloads are dumped by `make_n8n_form.py`
 
 ## REST API
 

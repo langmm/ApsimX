@@ -103,18 +103,18 @@ class CropModelFile(BaseModelFile):
         raise NotImplementedError  # pragma: no cover
 
     @BaseModelFile.parameter_property
-    def crop_name(self):
+    def crop_name(self) -> str:
         r"""str: Crop name."""
         return os.path.splitext(
             os.path.basename(self.fname_orig))[0].lower()
 
     @BaseModelFile.parameter_property
-    def crop_variety(self):
+    def crop_variety(self) -> Optional[str]:
         r"""str: Crop cultivar name."""
         return None  # raise KeyError("crop_variety")
 
     @BaseModelFile.parameter_property
-    def location(self):
+    def location(self) -> str:
         r"""str: Description of the field location."""
         try:
             lat = self.get("latitude")
@@ -124,7 +124,7 @@ class CropModelFile(BaseModelFile):
             return "the field"
 
     @BaseModelFile.parameter_property
-    def field_area(self):
+    def field_area(self) -> float:
         r"""float: Field area"""
         return 1.0
 
@@ -184,7 +184,7 @@ class BaseWeatherFile(BaseModelFile):
         return max(self.dates)
 
     @classmethod
-    def fetch_data(cls, *args, **kwargs):
+    def fetch_data(cls, *args: Any, **kwargs: Any) -> str:
         r"""Look for an existing file that contains the data for the
         requested location and dates. If one does not exist, create it
         by downloading data from NASA POWER and converting it to the
@@ -203,7 +203,7 @@ class BaseWeatherFile(BaseModelFile):
         return instance.fname
 
     @classmethod
-    def from_location(cls, *args, **kwargs) -> "BaseWeatherFile":
+    def from_location(cls, *args: Any, **kwargs: Any) -> "BaseWeatherFile":
         r"""Create a weather file from a location by requesting NASA
         power weather data.
 
@@ -242,7 +242,7 @@ class BaseWeatherFile(BaseModelFile):
                      start: Union[datetime.date, datetime.datetime],
                      end: Union[datetime.date, datetime.datetime],
                      latitude: Optional[float] = None,
-                     longitude: Optional[float] = None):
+                     longitude: Optional[float] = None) -> bool:
         r"""Check if the file contains data for the specified date/time
         range.
 
@@ -325,7 +325,7 @@ class NASAPOWERWeatherFile(BaseWeatherFile):
         return datetime.datetime.strptime(
             self.contents["header"]["end"], "%Y%m%d").date()
 
-    def add_missing_param(self, parameters: List[str]):
+    def add_missing_param(self, parameters: List[str]) -> None:
         r"""Fill in any missing parameters.
 
         Args:
@@ -405,7 +405,8 @@ class NASAPOWERWeatherFile(BaseWeatherFile):
         end_date = end_date or cls._default_end_date
         cache_dir = cache_dir or cls._default_cache_dir
 
-        def f2str(x):
+        def f2str(x: Any) -> str:
+            r"""Convert a value to a string for use in a file name."""
             if isinstance(x, datetime.date):
                 return x.isoformat()
             elif isinstance(x, float):
@@ -423,7 +424,8 @@ class NASAPOWERWeatherFile(BaseWeatherFile):
                       start_date: Union[datetime.date, datetime.datetime],
                       end_date: Union[datetime.date, datetime.datetime],
                       parameters: Optional[List[str]] = None,
-                      cache_dir: Optional[str] = None):
+                      cache_dir: Optional[str] = None
+                      ) -> "NASAPOWERWeatherFile":
         r"""Look for an existing file that contains the data for the
         requested location and dates. If one does not exist, create it
         by downloading data from NASA POWER.
@@ -576,8 +578,29 @@ class CropModelEngine(BaseModelEngine):
             longitude: Optional[float] = None,
             weather_file: Optional[str] = None,
             nasa_power_cache_dir: Optional[str] = None,
-            **kwargs
-    ):
+            **kwargs: Any
+    ) -> None:
+        r"""Initialize the crop model engine.
+
+        Args:
+            model_file: Path to one or more model input files.
+            crop_name: Name of the crop.
+            crop_variety: Name of the crop variety/cultivar.
+            sow_date: Date that the crop should be sown.
+            harvest_date: Date that the crop should be harvested.
+            season_length: Time between sowing and harvest. Only used
+                if only one of sow_date or harvest_date are used.
+            year: Year to use to get weather data.
+            latitude: Field latitude to use to get weather data.
+            longitude: Field longitude to use to get weather data.
+            weather_file: Path to a file containing NASA power weather
+                data.
+            nasa_power_cache_dir: Directory where NASA POWER weather
+                files should be cached.
+            **kwargs: Additional keywords arguments are passed along to
+                BaseModelEngine.__init__.
+
+        """
         if isinstance(season_length, int):
             season_length = datetime.timedelta(season_length)
         self.crop_name = crop_name
@@ -598,7 +621,7 @@ class CropModelEngine(BaseModelEngine):
                 self.crop_name, model_dir=kwargs.get("model_dir", None))
         super().__init__(model_file, **kwargs)
 
-    def update_model_file(self):
+    def update_model_file(self) -> None:
         r"""Update the model file to make it interactive and set the
         start/end times."""
         if self.latitude or self.longitude:
@@ -659,7 +682,7 @@ class CropModelEngine(BaseModelEngine):
         super().update_model_file()
 
     def calc_param(self, name: str, default: Optional[Any] = NoDefault,
-                   **kwargs):
+                   **kwargs: Any) -> Any:
         r"""Calculate a parameter from other parameters.
 
         Args:
@@ -683,12 +706,12 @@ class CropModelEngine(BaseModelEngine):
         return super().calc_param(name, default=default, **kwargs)
 
     @property
-    def location(self):
+    def location(self) -> str:
         r"""str: Description of the field location."""
         return self.model.location
 
     @property
-    def field_area(self):
+    def field_area(self) -> float:
         r"""float: Field area"""
         return self.model.field_area
 
@@ -708,8 +731,8 @@ class CropModelLLMPromptGenerator(BaseModelLLMPromptGenerator):
             start_date: Optional[datetime.date] = None,
             season_length: Optional[int] = 241,
             location: Optional[str] = "the field",
-            **kwargs
-    ):
+            **kwargs: Any
+    ) -> None:
         """Initialize the prompt generator.
 
         Args:
@@ -734,7 +757,7 @@ class CropModelLLMPromptGenerator(BaseModelLLMPromptGenerator):
     def from_env(
             cls,
             env: "CropModelEnv",
-            **kwargs
+            **kwargs: Any
     ) -> "CropModelLLMPromptGenerator":
         """Create prompt generator from a model gym environment.
 
