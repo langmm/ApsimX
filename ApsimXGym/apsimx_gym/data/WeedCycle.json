@@ -1,0 +1,127 @@
+// TODO:
+// - Dormancy rate based on light (other resource competition?)
+// - Set seed population from Synchroniser
+// - Check that residue is treated correctly on weed "harvest"
+// - Multiple cohorts w/ interval or ...?
+{
+    "$type": "Models.Manager, Models",
+    "CodeArray": [
+        "using Models.Interfaces;",
+        "using APSIM.Shared.Utilities;",
+        "using Models.Utilities;",
+        "using Models.Soils;",
+        "using Models.PMF;",
+        "using Models.Core;",
+        "using System;",
+        "using System.Linq;",
+        "using Models.Climate;",
+        "",
+        "namespace Models",
+        "{",
+        "    [Serializable] ",
+        "    public class Script : Model",
+        "    {",
+        "        [Link] private Clock Clock;",
+        "        [Link] private Summary Summary;",
+        "        [Link] private Soil Soil;",
+        "        private Accumulator accumulatedRain;",
+        "        [Link]",
+        "        private ISoilWater waterBalance;",
+        "        ",
+        "        [Description(\"Weed\")]",
+        "        public IPlant Weed { get; set; }",
+        "",
+        "        [Display(Type = DisplayType.CultivarName)]",
+        "        [Description(\"Cultivar to be sown\")]",
+        "        public string CultivarName { get; set; }",
+        "",
+        "        [Description(\"Sowing depth (mm)\")]",
+        "        public double SowingDepth { get; set; }",
+        "",
+        "        [Description(\"Row spacing (mm)\")]",
+        "        public double RowSpacing { get; set; }",
+        "",
+        "        [Description(\"Seed population (/m2)\")]",
+        "        public double Population { get; set; }",
+        "",
+        "        [Description(\"Germination rate\")]",
+        "        public double GerminationRate { get; set; }",
+        "",
+        "        [Description(\"Dormancy rate\")]",
+        "        public double DormancyRate { get; set; }",
+        "",
+        "        [Description(\"Seeds per plant\")]",
+        "        public double SeedsPerPlant { get; set; }",
+        "        ",
+        "        ",
+        "        [EventSubscribe(\"StartOfSimulation\")]",
+        "        private void OnSimulationCommencing(object sender, EventArgs e)",
+        "        {",
+        "            double PopulationGerminate = GerminationRate * Population * (1 - DormancyRate);",
+        "            Weed.Sow(seeds: PopulationGerminate, cultivar: CultivarName, depth: SowingDepth, rowSpacing: RowSpacing);    ",
+        "            Population = Population * DormancyRate;",
+        "        }",
+        "",
+        "        [EventSubscribe(\"DoManagement\")]",
+        "        private void OnDoManagement(object sender, EventArgs e)",
+        "        {",
+        "            if (Weed.IsReadyForHarvesting)",
+        "            {",
+        "                Population = Population + Weed.Population * SeedsPerPlant;",
+        "                Weed.Harvest(false);",
+        "                Weed.EndCrop();",
+        "            }",
+        "            if (!Weed.IsAlive &&",
+        "                Population > 0 && DormancyRate < 1 &&",
+        "                GerminationRate > 0)",
+        "            {",
+        "                double PopulationGerminate = GerminationRate * Population * (1 - DormancyRate);",
+        "                Weed.Sow(population: PopulationGerminate, cultivar: CultivarName, depth: SowingDepth, rowSpacing: RowSpacing);    ",
+        "                Population = Population * DormancyRate;",
+        "            }",
+        "        }",
+        "    }",
+        "}",
+        "       "
+    ],
+    "Parameters": [
+        {
+            "Key": "Weed",
+            "Value": "WheatWeed"
+        },
+        {
+            "Key": "CultivarName",
+            "Value": "Hartog"
+        },
+        {
+            "Key": "SowingDepth",
+            "Value": "30.0"
+        },
+        {
+            "Key": "RowSpacing",
+            "Value": "1000.0"
+        },
+        {
+            "Key": "Population",
+            "Value": "5.0"
+        },
+        {
+            // TODO: This should be based on the light conditions
+            "Key": "DormancyRate",
+            "Value": "0.5"  // TODO: Completely fabricated
+        },
+        {
+            "Key": "GerminationRate",
+            "Value": "1.0"  // TODO: Completely fabricated
+        },
+        {
+            "Key": "SeedsPerPlant",
+            "Value": "100"    // TODO: Completely fabricated
+        }
+    ],
+    "Name": "WEED Lifecycle",
+    "ResourceName": null,
+    "Children": [],
+    "Enabled": true,
+    "ReadOnly": false
+}
