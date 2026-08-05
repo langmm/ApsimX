@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Union, Any, List, Callable
 from . import logger
-from .utils import _gymdir, _apsimxdir, _datadir, LogPipe
+from .utils import _apsimxdir, _datadir, LogPipe
 from .base import (
     readonly_cached_property,
     RecoverableError, ModelEngineError, InvalidActionError,
@@ -362,20 +362,23 @@ class ApsimXFileNode:
         for x in self.contents.items():
             yield x
 
-    def specialize_crop(self, crop_name: str):
+    def specialize_crop(self, crop_name: str,
+                        parameter_name: str = "Crop"):
         r"""Specialize the crop referenced by the node.
 
         Args:
             crop_name: Name of crop to specialize.
+            parameter_name: Parameter name where the crop name is
+                stored.
 
         """
-        if self.has_parameter("Crop"):
+        if self.has_parameter(parameter_name):
             if "CROP" in self["Name"]:
                 prev = "CROP"
             else:
-                prev = self.get_parameter("Crop")
+                prev = self.get_parameter(parameter_name)
             self["Name"] = self["Name"].replace(prev, crop_name)
-            self.set_parameter("Crop", crop_name)
+            self.set_parameter(parameter_name, crop_name)
         for x in self.children:
             x.specialize_crop(crop_name)
 
